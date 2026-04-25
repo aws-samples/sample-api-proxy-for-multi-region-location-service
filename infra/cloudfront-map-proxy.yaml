@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFront proxy for Amazon Location Service map tiles - hides API Key from frontend
+
+Parameters:
+  LocationApiKeySecretName:
+    Type: String
+    Description: Secrets Manager secret name for Location Service API Key
+  AwsRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS Region for Location Service
+
+Resources:
+  AppendApiKeyFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-AppendApiKey"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Append Location API Key to origin requests
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub
+        - |
+          function handler(event) {
+            var request = event.request;
+            request.querystring['key'] = { value: '${ApiKeyValue}' };
+            return request;
+          }
+        - ApiKeyValue: !Sub "{{resolve:secretsmanager:${LocationApiKeySecretName}:SecretString}}"
+
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-MapTileCache"
+        DefaultTTL: 86400
+        MaxTTL: 604800
+        MinTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+
+  # Origin Request Policy: forward the 'key' param injected by CF Function to origin,
+  # but keep it out of the cache key (so the API key is never stored in CloudFront cache)
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-ForwardApiKey"
+        CookiesConfig:
+          CookieBehavior: none
+        HeadersConfig:
+          HeaderBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: whitelist
+          QueryStrings:
+            - key
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Amazon Location Service Map Tile Proxy
+        DefaultCacheBehavior:
+          TargetOriginId: LocationMapOrigin
+          ViewerProtocolPolicy: https-only
+          CachePolicyId: !Ref CachePolicy
+          OriginRequestPolicyId: !Ref OriginRequestPolicy
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt AppendApiKeyFunction.FunctionMetadata.FunctionARN
+        Origins:
+          - Id: LocationMapOrigin
+            DomainName: !Sub "maps.geo.${AwsRegion}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+
+Outputs:
+  CloudFrontDomain:
+    Description: Use this as MAP_TILE_DOMAIN environment variable
+    Value: !GetAtt Distribution.DomainName
+  MapStyleUrl:
+    Description: Map style URL (for testing)
+    Value: !Sub "https://${Distribution.DomainName}/v2/styles/Standard/descriptor"

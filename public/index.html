@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amazon Location Service Demo</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    #map { width: 100vw; height: 100vh; }
+
+    .search-box {
+      position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+      width: 420px; z-index: 10;
+    }
+    .search-box input {
+      width: 100%; padding: 12px 16px; font-size: 15px;
+      border: none; border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+      outline: none;
+    }
+    .suggestions {
+      margin-top: 4px; background: #fff; border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+      overflow: hidden; display: none;
+    }
+    .suggestions.active { display: block; }
+    .suggestion-item {
+      padding: 10px 16px; cursor: pointer; font-size: 14px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .suggestion-item:hover { background: #f5f7fa; }
+    .suggestion-item .main { font-weight: 500; }
+    .suggestion-item .sub { color: #888; font-size: 12px; margin-top: 2px; }
+
+    .info-panel {
+      position: absolute; bottom: 24px; left: 16px;
+      background: #fff; border-radius: 8px; padding: 16px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+      max-width: 360px; display: none; font-size: 14px; z-index: 10;
+    }
+    .info-panel.active { display: block; }
+    .info-panel h3 { margin-bottom: 8px; font-size: 15px; }
+    .info-panel p { color: #555; line-height: 1.5; }
+    .locate-btn {
+      position: absolute; bottom: 24px; right: 16px; z-index: 10;
+      width: 44px; height: 44px; border-radius: 50%; border: none;
+      background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      cursor: pointer; font-size: 20px;
+    }
+    .locate-btn:hover { background: #f0f0f0; }
+
+    .style-switcher {
+      position: absolute; top: 16px; right: 56px; z-index: 10;
+      display: flex; gap: 4px;
+      background: #fff; border-radius: 8px; padding: 4px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    }
+    .style-btn {
+      padding: 6px 12px; border: none; border-radius: 6px;
+      background: transparent; cursor: pointer; font-size: 13px;
+      color: #555; white-space: nowrap;
+    }
+    .style-btn:hover { background: #f0f0f0; }
+    .style-btn.active { background: #0073bb; color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="search-box">
+    <input id="search-input" type="text" placeholder="🔍 搜索地址..." autocomplete="off" />
+    <div id="suggestions" class="suggestions"></div>
+  </div>
+
+  <div id="info-panel" class="info-panel">
+    <h3 id="info-title"></h3>
+    <p id="info-address"></p>
+    <p id="info-coords" style="color:#aaa;font-size:12px;margin-top:4px;"></p>
+  </div>
+
+  <button class="locate-btn" id="locate-btn" title="定位到当前位置">📍</button>
+
+  <div class="style-switcher" id="style-switcher"></div>
+
+  <script>
+    let map, marker;
+
+    async function init() {
+      // Load available map styles and render switcher buttons
+      const stylesRes = await fetch("/api/map-styles");
+      const styles = await stylesRes.json();
+      const switcher = document.getElementById("style-switcher");
+      styles.forEach((s, i) => {
+        const btn = document.createElement("button");
+        btn.className = "style-btn" + (i === 0 ? " active" : "");
+        btn.dataset.style = s.id;
+        btn.textContent = s.label;
+        switcher.appendChild(btn);
+      });
+
+      // Required for rendering RTL text (Arabic, Hebrew, etc.) in map labels
+      maplibregl.setRTLTextPlugin(
+        'https://unpkg.com/@mapbox/mapbox-gl-rtl-text@0.2.3/mapbox-gl-rtl-text.min.js',
+        null,
+        true // lazy load
+      );
+
+      map = new maplibregl.Map({
+        container: "map",
+        // Style is proxied through Express: descriptor fetched server-side,
+        // tile URLs rewritten to CloudFront, API key never exposed to browser
+        style: "/api/map-style",
+        center: [116.4, 39.9], // Beijing
+        zoom: 12,
+      });
+      map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+      map.on('error', (e) => console.error('Map error:', e.error));
+      map.once('styledata', () => {
+        map.resize();
+        map.triggerRepaint();
+      });
+    }
+
+    function setMarker(lng, lat, title, zoom) {
+      if (marker) marker.remove();
+      marker = new maplibregl.Marker({ color: "#FF4444" })
+        .setLngLat([lng, lat])
+        .setPopup(new maplibregl.Popup().setText(title || ""))
+        .addTo(map);
+      marker.togglePopup();
+      map.flyTo({ center: [lng, lat], zoom: zoom || 12 });
+    }
+
+    function showInfo(title, address, lng, lat) {
+      document.getElementById("info-title").textContent = title;
+      document.getElementById("info-address").textContent = address || "";
+      document.getElementById("info-coords").textContent = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+      document.getElementById("info-panel").classList.add("active");
+    }
+
+    // Debounced search
+    let timer;
+    const input = document.getElementById("search-input");
+    const sugBox = document.getElementById("suggestions");
+
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (!q) { sugBox.classList.remove("active"); return; }
+      timer = setTimeout(() => fetchSuggestions(q), 300);
+    });
+
+    input.addEventListener("focus", () => {
+      if (sugBox.children.length) sugBox.classList.add("active");
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(".search-box")) sugBox.classList.remove("active");
+    });
+
+    async function fetchSuggestions(query) {
+      const center = map.getCenter();
+      const res = await fetch(`/api/suggest?query=${encodeURIComponent(query)}&lat=${center.lat}&lng=${center.lng}`);
+      const items = await res.json();
+
+      sugBox.innerHTML = "";
+      items.forEach((item) => {
+        const div = document.createElement("div");
+        div.className = "suggestion-item";
+
+        const addr = item.address;
+        const subText = addr ? [addr.District, addr.Municipality, addr.Region, addr.Country?.Name].filter(Boolean).join(", ") : "";
+
+        div.innerHTML = `<div class="main">${item.text}</div><div class="sub">${subText}</div>`;
+        div.addEventListener("click", () => selectSuggestion(item));
+        sugBox.appendChild(div);
+      });
+      sugBox.classList.toggle("active", items.length > 0);
+    }
+
+    async function selectSuggestion(item) {
+      sugBox.classList.remove("active");
+      input.value = item.text;
+
+      // If we already have position from suggestion
+      if (item.position) {
+        const [lng, lat] = item.position;
+        setMarker(lng, lat, item.text);
+        const addr = item.address;
+        showInfo(item.text, addr ? [addr.Street, addr.District, addr.Municipality].filter(Boolean).join(" ") : "", lng, lat);
+        return;
+      }
+
+      // Otherwise fetch place details
+      if (!item.placeId) return;
+      const res = await fetch(`/api/place/${item.placeId}`);
+      const place = await res.json();
+      if (place.position) {
+        const [lng, lat] = place.position;
+        setMarker(lng, lat, place.label);
+        const addr = place.address;
+        showInfo(place.label, addr ? addr.Label : "", lng, lat);
+      }
+    }
+
+    // Style switcher
+    let currentStyle = "Standard";
+    document.getElementById("style-switcher").addEventListener("click", async (e) => {
+      const btn = e.target.closest(".style-btn");
+      if (!btn) return;
+      const styleName = btn.dataset.style;
+      if (styleName === currentStyle) return;
+
+      currentStyle = styleName;
+      document.querySelectorAll(".style-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+
+      const center = map.getCenter();
+      const zoom = map.getZoom();
+      map.setStyle(`/api/map-style?style=${styleName}`);
+      map.once("styledata", () => {
+        map.setCenter(center);
+        map.setZoom(zoom);
+        map.resize();
+        map.triggerRepaint();
+      });
+    });
+
+    // Geolocation
+    document.getElementById("locate-btn").addEventListener("click", () => {
+      if (!navigator.geolocation) return alert("浏览器不支持定位");
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const { longitude: lng, latitude: lat } = pos.coords;
+          setMarker(lng, lat, "我的位置");
+          showInfo("我的位置", "当前设备定位", lng, lat);
+        },
+        (err) => alert("定位失败: " + err.message),
+        { enableHighAccuracy: true }
+      );
+    });
+
+    init();
+  </script>
+</body>
+</html>

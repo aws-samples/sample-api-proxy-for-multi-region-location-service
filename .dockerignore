@@ -1,0 +1,9 @@
+node_modules
+.git
+.kiro
+.vscode
+infra
+README.md
+Dockerfile
+.dockerignore
+.gitignore
