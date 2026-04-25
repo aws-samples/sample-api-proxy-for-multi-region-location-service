@@ -211,6 +211,9 @@ Resources:
       Memory: "512"
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: app
@@ -272,22 +275,8 @@ Resources:
           EnableAcceptEncodingGzip: true
           EnableAcceptEncodingBrotli: true
 
-  ApiCachePolicy:
-    Type: AWS::CloudFront::CachePolicy
-    Properties:
-      CachePolicyConfig:
-        Name: !Sub "${AWS::StackName}-ApiNoCache"
-        DefaultTTL: 0
-        MaxTTL: 0
-        MinTTL: 0
-        ParametersInCacheKeyAndForwardedToOrigin:
-          CookiesConfig:
-            CookieBehavior: none
-          HeadersConfig:
-            HeaderBehavior: none
-          QueryStringsConfig:
-            QueryStringBehavior: all
-          EnableAcceptEncodingGzip: true
+  # Use AWS managed CachingDisabled policy for API requests
+  # Managed policy ID: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
 
   ApiOriginRequestPolicy:
     Type: AWS::CloudFront::OriginRequestPolicy
@@ -325,14 +314,14 @@ Resources:
           - PathPattern: /api/*
             TargetOriginId: ALBOrigin
             ViewerProtocolPolicy: redirect-to-https
-            CachePolicyId: !Ref ApiCachePolicy
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
             Compress: true
           - PathPattern: /health
             TargetOriginId: ALBOrigin
             ViewerProtocolPolicy: redirect-to-https
-            CachePolicyId: !Ref ApiCachePolicy
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             AllowedMethods: [GET, HEAD]
             Compress: true
 
