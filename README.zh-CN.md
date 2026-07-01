@@ -1,6 +1,6 @@
-# Amazon Location Service Demo
+# Amazon Location Service Proxy
 
-地址自动补全 + 地图定位 Demo，基于 Amazon Location Service 和 MapLibre GL JS。
+地址自动补全 + 地图定位服务端代理，基于 Amazon Location Service 和 MapLibre GL JS。
 
 [English](README.md)
 
@@ -84,7 +84,7 @@ aws location create-key \
 
 ```bash
 aws secretsmanager create-secret \
-  --name location-demo/api-keys \
+  --name location-proxy/api-keys \
   --secret-string '{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy"}' \
   --region <deploy-region>
 ```
@@ -97,7 +97,7 @@ CloudFront 模板 `infra/cloudfront-map-proxy.yaml` 由脚本根据 `ENABLED_REG
 ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1 node scripts/generate-cloudfront-template.js
 ```
 
-生成的模板会通过 `{{resolve:secretsmanager:location-demo/api-keys:SecretString:<region>}}` 直接读取上一步的 JSON secret，无需再传参。然后部署：
+生成的模板会通过 `{{resolve:secretsmanager:location-proxy/api-keys:SecretString:<region>}}` 直接读取上一步的 JSON secret，无需再传参。然后部署：
 
 ```bash
 aws cloudformation deploy \
@@ -151,7 +151,7 @@ npm start
 ### 1. 创建 ECR 仓库并推送镜像
 
 ```bash
-aws ecr create-repository --repository-name location-demo --region <your-region>
+aws ecr create-repository --repository-name location-proxy --region <your-region>
 
 # 登录 ECR
 aws ecr get-login-password --region <your-region> | \
@@ -159,9 +159,9 @@ aws ecr get-login-password --region <your-region> | \
 
 # 构建并推送（构建前确保已从示例创建 config/country-region-map.json）
 cp -n config/country-region-map-example.json config/country-region-map.json 2>/dev/null || true
-docker build -t location-demo .
-docker tag location-demo:latest <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest
-docker push <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest
+docker build -t location-proxy .
+docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-proxy:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-proxy:latest
 ```
 
 ### 2. 部署 ECS Fargate 栈
@@ -169,15 +169,15 @@ docker push <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:lates
 ```bash
 aws cloudformation deploy \
   --template-file infra/ecs-fargate.yaml \
-  --stack-name location-demo-ecs \
+  --stack-name location-proxy-ecs \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-demo/api-keys-XXXXXX \
+    LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-proxy/api-keys-XXXXXX \
     HomeRegion=ap-northeast-1 \
     EnabledRegions=ap-northeast-1,eu-west-1,us-east-1 \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
-    ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-demo:latest \
+    ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
   --region <deploy-region>
 ```
 
@@ -185,7 +185,7 @@ aws cloudformation deploy \
 
 ```bash
 aws cloudformation describe-stacks \
-  --stack-name location-demo-ecs \
+  --stack-name location-proxy-ecs \
   --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' \
   --output text \
   --region <your-region>

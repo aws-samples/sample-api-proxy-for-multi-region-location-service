@@ -21,7 +21,7 @@ Resources:
             request.querystring['key'] = { value: '${ApiKeyValue}' };
             return request;
           }
-        - ApiKeyValue: !Sub "{{resolve:secretsmanager:location-demo/api-keys:SecretString:ap-northeast-1}}"
+        - ApiKeyValue: !Sub "{{resolve:secretsmanager:location-proxy/api-keys:SecretString:ap-northeast-1}}"
 
   EuWest1AppendKeyFunction:
     Type: AWS::CloudFront::Function
@@ -39,7 +39,7 @@ Resources:
             request.querystring['key'] = { value: '${ApiKeyValue}' };
             return request;
           }
-        - ApiKeyValue: !Sub "{{resolve:secretsmanager:location-demo/api-keys:SecretString:eu-west-1}}"
+        - ApiKeyValue: !Sub "{{resolve:secretsmanager:location-proxy/api-keys:SecretString:eu-west-1}}"
 
   UsEast1AppendKeyFunction:
     Type: AWS::CloudFront::Function
@@ -57,7 +57,7 @@ Resources:
             request.querystring['key'] = { value: '${ApiKeyValue}' };
             return request;
           }
-        - ApiKeyValue: !Sub "{{resolve:secretsmanager:location-demo/api-keys:SecretString:us-east-1}}"
+        - ApiKeyValue: !Sub "{{resolve:secretsmanager:location-proxy/api-keys:SecretString:us-east-1}}"
 
   CachePolicy:
     Type: AWS::CloudFront::CachePolicy

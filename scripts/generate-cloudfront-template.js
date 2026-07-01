@@ -128,7 +128,7 @@ function main() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const secretName = process.env.LOCATION_API_KEYS_SECRET_NAME || "location-demo/api-keys";
+  const secretName = process.env.LOCATION_API_KEYS_SECRET_NAME || "location-proxy/api-keys";
   if (!regions.length) {
     console.error("Set ENABLED_REGIONS (comma-separated) to generate the template");
     process.exit(1);

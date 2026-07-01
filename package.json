@@ -1,7 +1,7 @@
 {
-  "name": "location-service-demo",
+  "name": "location-service-proxy",
   "version": "1.0.0",
-  "description": "Amazon Location Service - Address Autocomplete & Map Demo",
+  "description": "Amazon Location Service - Server-side Proxy for Address Autocomplete & Maps",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

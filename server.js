@@ -124,7 +124,7 @@ async function main() {
 
   const app = buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles });
   app.listen(PORT, () => {
-    console.log(`🗺️  Demo running at http://localhost:${PORT}`);
+    console.log(`🗺️  Proxy running at http://localhost:${PORT}`);
     console.log(`   HOME_REGION: ${config.homeRegion}`);
     console.log(`   MULTI_REGION_ROUTING: ${config.routingEnabled}`);
     console.log(`   ENABLED_REGIONS: ${[...config.enabledRegions].join(", ")}`);

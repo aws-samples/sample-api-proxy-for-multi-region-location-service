@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: ECS Fargate + ALB deployment for Location Service Demo
+Description: ECS Fargate + ALB deployment for Location Service Proxy
 
 # CloudFront managed prefix list IDs per region
 # Source: https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html
@@ -59,7 +59,7 @@ Parameters:
     AllowedValues: ["true", "false"]
   ImageUri:
     Type: String
-    Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/location-demo:latest)
+    Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/location-proxy:latest)
   DesiredCount:
     Type: Number
     Default: 2

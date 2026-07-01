@@ -3,7 +3,7 @@ const assert = require("node:assert");
 const { buildTemplate } = require("../scripts/generate-cloudfront-template");
 
 test("generates one origin + behavior + function per region", () => {
-  const tpl = buildTemplate(["ap-northeast-1", "eu-west-1"], "location-demo/api-keys");
+  const tpl = buildTemplate(["ap-northeast-1", "eu-west-1"], "location-proxy/api-keys");
   // CloudFront Function per region, each resolving its own region key
   assert.match(tpl, /ApNortheast1AppendKeyFunction/);
   assert.match(tpl, /EuWest1AppendKeyFunction/);
