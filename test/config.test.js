@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { validateConfig } = require("../src/config");
+const { validateConfig, loadConfig } = require("../src/config");
 
 function base(overrides = {}) {
   return {
@@ -58,4 +58,37 @@ test("rejects HOME_REGION missing a key", () => {
     })),
     /missing API key.*ap-northeast-1/
   );
+});
+
+test("loadConfig parses env with defaults", () => {
+  const cfg = loadConfig({ LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d" });
+  assert.strictEqual(cfg.homeRegion, "us-east-1");
+  assert.strictEqual(cfg.routingEnabled, false);
+  assert.ok(cfg.enabledRegions.has("us-east-1"));
+});
+
+test("loadConfig trims and filters ENABLED_REGIONS", () => {
+  const cfg = loadConfig({
+    HOME_REGION: "eu-west-1",
+    ENABLED_REGIONS: "eu-west-1, us-east-1, ",
+    LOCATION_API_KEYS: '{"eu-west-1":"k1","us-east-1":"k2"}',
+    MAP_TILE_DOMAIN: "d",
+  });
+  assert.strictEqual(cfg.enabledRegions.size, 2);
+  assert.ok(cfg.enabledRegions.has("us-east-1"));
+});
+
+test("loadConfig throws when MAP_TILE_DOMAIN missing", () => {
+  assert.throws(() => loadConfig({ LOCATION_API_KEYS: '{"us-east-1":"k"}' }), /MAP_TILE_DOMAIN/);
+});
+
+test("loadConfig parses MULTI_REGION_ROUTING=true", () => {
+  const cfg = loadConfig({
+    HOME_REGION: "ap-northeast-1",
+    MULTI_REGION_ROUTING: "true",
+    ENABLED_REGIONS: "ap-northeast-1",
+    LOCATION_API_KEYS: '{"ap-northeast-1":"k"}',
+    MAP_TILE_DOMAIN: "d",
+  });
+  assert.strictEqual(cfg.routingEnabled, true);
 });
