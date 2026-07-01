@@ -49,3 +49,12 @@ test("rewriteStyle replaces region origin with CloudFront region-prefixed path a
   assert.strictEqual(out.sprite, "https://d1.cloudfront.net/eu-west-1/v2/sprites/x");
   assert.deepStrictEqual(out.layers[0].paint, { y: 1 });
 });
+
+test("getPlace hits the region's place endpoint with placeId and language", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { Title: "x" }) });
+  await als.getPlace({ region: "eu-west-1", key: "k2", placeId: "abc123" });
+  assert.match(captured.url, /places\.geo\.eu-west-1\.amazonaws\.com\/v2\/place\/abc123/);
+  assert.match(captured.url, /language=zh/);
+  assert.match(captured.url, /key=k2/);
+});
