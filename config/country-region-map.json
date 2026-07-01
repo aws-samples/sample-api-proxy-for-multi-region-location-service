@@ -1,0 +1,7 @@
+{
+  "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH", "MM", "KH"],
+  "ap-northeast-1": ["JP", "KR", "CN", "TW", "HK", "MO"],
+  "ap-south-1": ["IN", "BD", "LK", "NP", "PK"],
+  "eu-west-1": ["GB", "FR", "DE", "ES", "IT", "NL", "IE", "BE"],
+  "us-east-1": ["US", "CA", "MX", "BR", "AR", "CL"]
+}

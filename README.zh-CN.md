@@ -35,9 +35,11 @@
 ## 前置条件
 
 1. AWS 账号，已开通 Amazon Location Service
-2. 创建 Location Service **API Key**（需要包含 `geo-places` 和 `geo-maps` 权限）
+2. 为**每个启用的区域**创建一个 Location Service **API Key**（每个 key 需同时包含 `geo-places` 和 `geo-maps` 权限）
 
 ### 创建 API Key（AWS CLI）
+
+在每个要启用的区域各执行一次（`--region` 换成对应区域）：
 
 ```bash
 aws location create-key \
@@ -52,27 +54,48 @@ aws location create-key \
   --region <your-region>
 ```
 
+## 环境变量
+
+多区域路由通过以下环境变量配置：
+
+| 变量 | 说明 | 示例 |
+|---|---|---|
+| `HOME_REGION` | ALS 缺省/引导区域（路由开关开时必须为全球覆盖区，不能是 GrabMaps 区 ap-southeast-1/5） | `ap-northeast-1` |
+| `MULTI_REGION_ROUTING` | 多区域路由总开关，默认 `false`（= 现状单区域行为） | `true` |
+| `ENABLED_REGIONS` | 在用 ALS 区域，逗号分隔 | `ap-northeast-1,eu-west-1,us-east-1` |
+| `LOCATION_API_KEYS` | JSON secret：region→API Key（每 key 含 geo-places + geo-maps 权限） | `{"ap-northeast-1":"v1.public.xxx"}` |
+| `MAP_TILE_DOMAIN` | CloudFront 瓦片域名 | `d123.cloudfront.net` |
+
+国家→区域映射在 `config/country-region-map.json`（区域优先结构）维护，改后重新部署即可生效（零停机滚动更新）。
+
 ## 部署
 
-### 0. 将 API Key 存入 Secrets Manager
+### 0. 将各区域 API Key 存入 Secrets Manager
+
+所有区域的 key 存入**同一个 JSON secret**（key 为区域名，value 为该区域的 API Key）：
 
 ```bash
 aws secretsmanager create-secret \
-  --name location-demo/api-key \
-  --secret-string "v1.public.xxxxx" \
-  --region <your-region>
+  --name location-demo/api-keys \
+  --secret-string '{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy"}' \
+  --region <deploy-region>
 ```
 
-### 1. 部署 CloudFront 地图瓦片代理
+### 1. 生成并部署 CloudFront 地图瓦片代理
+
+CloudFront 模板 `infra/cloudfront-map-proxy.yaml` 由脚本根据 `ENABLED_REGIONS` 生成（每个区域生成一个 origin、一条 `/<region>/*` 行为，以及一个在边缘注入该区域 key 并剥掉区域路径前缀的 CloudFront Function）。先生成模板：
+
+```bash
+ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1 node scripts/generate-cloudfront-template.js
+```
+
+生成的模板会通过 `{{resolve:secretsmanager:location-demo/api-keys:SecretString:<region>}}` 直接读取上一步的 JSON secret，无需再传参。然后部署：
 
 ```bash
 aws cloudformation deploy \
   --template-file infra/cloudfront-map-proxy.yaml \
   --stack-name location-map-proxy \
-  --parameter-overrides \
-    LocationApiKeySecretName=location-demo/api-key \
-    AwsRegion=<your-location-service-region> \
-  --region <your-region>
+  --region <deploy-region>
 ```
 
 部署完成后获取 CloudFront 域名：
@@ -90,12 +113,16 @@ aws cloudformation describe-stacks \
 ```bash
 npm install
 
-export AWS_REGION=<your-region>
-export LOCATION_API_KEY=v1.public.xxxxx
+export HOME_REGION=ap-northeast-1
+export MULTI_REGION_ROUTING=true
+export ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1
+export LOCATION_API_KEYS='{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy","us-east-1":"v1.public.zzz"}'
 export MAP_TILE_DOMAIN=d1234567890.cloudfront.net  # 上一步获取的域名
 
 npm start
 ```
+
+如需保持现状单区域行为，将 `MULTI_REGION_ROUTING` 设为 `false`（默认值），并将 `HOME_REGION` / `ENABLED_REGIONS` 设为同一个区域即可。
 
 打开 http://localhost:3000
 
@@ -133,11 +160,13 @@ aws cloudformation deploy \
   --stack-name location-demo-ecs \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    LocationApiKeySecretArn=arn:aws:secretsmanager:<your-region>:<ACCOUNT_ID>:secret:location-demo/api-key-XXXXXX \
+    LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-demo/api-keys-XXXXXX \
+    HomeRegion=ap-northeast-1 \
+    EnabledRegions=ap-northeast-1,eu-west-1,us-east-1 \
+    MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
-    AwsRegion=<your-location-service-region> \
-    ImageUri=<ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest \
-  --region <your-region>
+    ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-demo:latest \
+  --region <deploy-region>
 ```
 
 ### 3. 获取访问地址

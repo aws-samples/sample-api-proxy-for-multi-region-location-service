@@ -34,9 +34,11 @@ Browser
 ## Prerequisites
 
 1. An AWS account with Amazon Location Service enabled
-2. A Location Service **API Key** with `geo-places` and `geo-maps` permissions
+2. One Location Service **API Key per enabled region** (each key needs both `geo-places` and `geo-maps` permissions)
 
 ### Create an API Key (AWS CLI)
+
+Run once per region you want to enable (swap `--region` for each region):
 
 ```bash
 aws location create-key \
@@ -51,27 +53,48 @@ aws location create-key \
   --region <your-region>
 ```
 
+## Environment Variables
+
+Multi-region routing is configured through the following environment variables:
+
+| Variable | Description | Example |
+|---|---|---|
+| `HOME_REGION` | Default/guide ALS region (must be a global-coverage region when routing is on — not a GrabMaps region ap-southeast-1/5) | `ap-northeast-1` |
+| `MULTI_REGION_ROUTING` | Master switch for multi-region routing; defaults to `false` (= current single-region behavior) | `true` |
+| `ENABLED_REGIONS` | ALS regions in use, comma-separated | `ap-northeast-1,eu-west-1,us-east-1` |
+| `LOCATION_API_KEYS` | JSON secret: region→API Key (each key has geo-places + geo-maps permissions) | `{"ap-northeast-1":"v1.public.xxx"}` |
+| `MAP_TILE_DOMAIN` | CloudFront map-tile domain | `d123.cloudfront.net` |
+
+The country→region mapping is maintained in `config/country-region-map.json` (region-first structure); changing it takes effect after a redeploy (zero-downtime rolling update).
+
 ## Deployment
 
-### 0. Store the API Key in Secrets Manager
+### 0. Store the per-region API Keys in Secrets Manager
+
+Store all region keys in a **single JSON secret** (key = region name, value = that region's API Key):
 
 ```bash
 aws secretsmanager create-secret \
-  --name location-demo/api-key \
-  --secret-string "v1.public.xxxxx" \
-  --region <your-region>
+  --name location-demo/api-keys \
+  --secret-string '{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy"}' \
+  --region <deploy-region>
 ```
 
-### 1. Deploy the CloudFront Map Tile Proxy
+### 1. Generate and Deploy the CloudFront Map Tile Proxy
+
+The CloudFront template `infra/cloudfront-map-proxy.yaml` is generated from `ENABLED_REGIONS` (per region: an origin, a `/<region>/*` behavior, and a CloudFront Function that injects that region's key at the edge and strips the region path prefix). Generate the template first:
+
+```bash
+ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1 node scripts/generate-cloudfront-template.js
+```
+
+The generated template reads the JSON secret from the previous step directly via `{{resolve:secretsmanager:location-demo/api-keys:SecretString:<region>}}`, so no parameters are needed. Then deploy:
 
 ```bash
 aws cloudformation deploy \
   --template-file infra/cloudfront-map-proxy.yaml \
   --stack-name location-map-proxy \
-  --parameter-overrides \
-    LocationApiKeySecretName=location-demo/api-key \
-    AwsRegion=<your-location-service-region> \
-  --region <your-region>
+  --region <deploy-region>
 ```
 
 Get the CloudFront domain after deployment:
@@ -89,12 +112,16 @@ aws cloudformation describe-stacks \
 ```bash
 npm install
 
-export AWS_REGION=<your-region>
-export LOCATION_API_KEY=v1.public.xxxxx
+export HOME_REGION=ap-northeast-1
+export MULTI_REGION_ROUTING=true
+export ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1
+export LOCATION_API_KEYS='{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy","us-east-1":"v1.public.zzz"}'
 export MAP_TILE_DOMAIN=d1234567890.cloudfront.net  # domain from previous step
 
 npm start
 ```
+
+To keep the current single-region behavior, set `MULTI_REGION_ROUTING` to `false` (the default) and point `HOME_REGION` / `ENABLED_REGIONS` at the same region.
 
 Open http://localhost:3000
 
@@ -132,11 +159,13 @@ aws cloudformation deploy \
   --stack-name location-demo-ecs \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    LocationApiKeySecretArn=arn:aws:secretsmanager:<your-region>:<ACCOUNT_ID>:secret:location-demo/api-key-XXXXXX \
+    LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-demo/api-keys-XXXXXX \
+    HomeRegion=ap-northeast-1 \
+    EnabledRegions=ap-northeast-1,eu-west-1,us-east-1 \
+    MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
-    AwsRegion=<your-location-service-region> \
-    ImageUri=<ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest \
-  --region <your-region>
+    ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-demo:latest \
+  --region <deploy-region>
 ```
 
 ### 3. Get the Access URL
