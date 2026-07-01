@@ -19,6 +19,5 @@ test("generates one origin + behavior + function per region", () => {
 
 test("edge function strips the region path prefix before forwarding", () => {
   const tpl = buildTemplate(["eu-west-1"], "s");
-  assert.match(tpl, /\/eu-west-1/); // prefix referenced in function code
-  assert.match(tpl, /uri/); // function manipulates request.uri
+  assert.match(tpl, /request\.uri = request\.uri\.slice\('\/eu-west-1'\.length\);/);
 });

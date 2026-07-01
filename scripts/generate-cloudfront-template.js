@@ -23,7 +23,7 @@ function functionResource(region, secretName) {
         - |
           function handler(event) {
             var request = event.request;
-            request.uri = request.uri.replace('/${region}', '');
+            request.uri = request.uri.slice('/${region}'.length);
             request.querystring['key'] = { value: '\${ApiKeyValue}' };
             return request;
           }
@@ -134,6 +134,7 @@ function main() {
     process.exit(1);
   }
   const out = path.join(__dirname, "..", "infra", "cloudfront-map-proxy.yaml");
+  fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, buildTemplate(regions, secretName));
   console.log(`Wrote ${out} for regions: ${regions.join(", ")}`);
 }
