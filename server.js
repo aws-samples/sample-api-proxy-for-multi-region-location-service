@@ -73,16 +73,6 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     }
   });
 
-  app.get("/api/map-config", (req, res) => {
-    // Map tiles are region-specific; default to home region for initial load.
-    const region = config.homeRegion;
-    res.json({
-      region,
-      styleUrl: `https://${config.mapTileDomain}/${region}/v2/styles/Standard/descriptor`,
-      tileBaseUrl: `https://${config.mapTileDomain}/${region}`,
-    });
-  });
-
   app.get("/api/map-style", async (req, res) => {
     const styleName = req.query.style || "Standard";
     const { countryCode, lat, lng } = req.query;
