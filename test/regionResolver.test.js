@@ -46,3 +46,19 @@ test("no input falls back to home", async () => {
   const r = await resolveRegion({ routingEnabled: true }, deps());
   assert.deepStrictEqual(r, { targetRegion: HOME, source: "no-input-fallback" });
 });
+
+test("reverse-geocoded unmapped country uses distinct fallback source", async () => {
+  const r = await resolveRegion(
+    { lat: 10, lng: 10, routingEnabled: true },
+    deps({ reverseGeocodeToCountry: async () => "ZZ" })
+  );
+  assert.deepStrictEqual(r, { targetRegion: HOME, source: "reverse-geo-map-miss-fallback" });
+});
+
+test("countryCode takes precedence over lat/lng", async () => {
+  const r = await resolveRegion(
+    { countryCode: "JP", lat: 52.5, lng: 13.4, routingEnabled: true },
+    deps()
+  );
+  assert.deepStrictEqual(r, { targetRegion: "ap-northeast-1", source: "country-map" });
+});

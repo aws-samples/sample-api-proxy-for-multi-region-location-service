@@ -9,6 +9,8 @@ async function resolveRegion(input, deps) {
     return { targetRegion: homeRegion, source: "home-disabled" };
   }
 
+  // countryCode takes precedence over lat/lng: an explicit country is
+  // authoritative, so coords are ignored when both are present.
   if (countryCode) {
     const region = getRegion(countryCode);
     return region
@@ -24,7 +26,7 @@ async function resolveRegion(input, deps) {
     const region = getRegion(cc);
     return region
       ? { targetRegion: region, source: "reverse-geo" }
-      : { targetRegion: homeRegion, source: "country-map-miss-fallback" };
+      : { targetRegion: homeRegion, source: "reverse-geo-map-miss-fallback" };
   }
 
   return { targetRegion: homeRegion, source: "no-input-fallback" };
