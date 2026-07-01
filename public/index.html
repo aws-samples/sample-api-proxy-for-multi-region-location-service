@@ -164,7 +164,11 @@
 
     async function fetchSuggestions(query) {
       const center = map.getCenter();
-      const res = await fetch(`/api/suggest?query=${encodeURIComponent(query)}&lat=${center.lat}&lng=${center.lng}`);
+      const cc = window.COUNTRY_CODE || ""; // optionally set by host business page
+      const ccParam = cc ? `&countryCode=${encodeURIComponent(cc)}` : "";
+      const res = await fetch(
+        `/api/suggest?query=${encodeURIComponent(query)}&lat=${center.lat}&lng=${center.lng}${ccParam}`
+      );
       const items = await res.json();
 
       sugBox.innerHTML = "";
@@ -221,7 +225,9 @@
 
       const center = map.getCenter();
       const zoom = map.getZoom();
-      map.setStyle(`/api/map-style?style=${styleName}`);
+      const cc = window.COUNTRY_CODE || "";
+      const ccParam = cc ? `&countryCode=${encodeURIComponent(cc)}` : "";
+      map.setStyle(`/api/map-style?style=${styleName}${ccParam}`);
       map.once("styledata", () => {
         map.setCenter(center);
         map.setZoom(zoom);
