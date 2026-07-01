@@ -67,6 +67,14 @@ Multi-region routing is configured through the following environment variables:
 
 The country→region mapping is maintained in `config/country-region-map.json` (region-first structure); changing it takes effect after a redeploy (zero-downtime rolling update).
 
+> **Note**: The real `config/country-region-map.json` is gitignored (each environment's country list may differ and it is treated as deployment config); the repo only tracks the example file `config/country-region-map-example.json`. On first use, copy it and edit as needed:
+>
+> ```bash
+> cp config/country-region-map-example.json config/country-region-map.json
+> ```
+>
+> This file is required at runtime: the app reads it on startup and fails fast if missing (the error tells you to run the `cp` above). `docker build` also bakes it into the image, so **it must exist before building the image** too.
+
 ## Deployment
 
 ### 0. Store the per-region API Keys in Secrets Manager
@@ -112,6 +120,9 @@ aws cloudformation describe-stacks \
 ```bash
 npm install
 
+# Prepare the country→region mapping (copy from the example, then edit as needed)
+cp config/country-region-map-example.json config/country-region-map.json
+
 export HOME_REGION=ap-northeast-1
 export MULTI_REGION_ROUTING=true
 export ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1
@@ -145,7 +156,8 @@ aws ecr create-repository --repository-name location-demo --region <your-region>
 aws ecr get-login-password --region <your-region> | \
   docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com
 
-# Build and push
+# Build and push (ensure config/country-region-map.json exists, created from the example)
+cp -n config/country-region-map-example.json config/country-region-map.json 2>/dev/null || true
 docker build -t location-demo .
 docker tag location-demo:latest <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest
 docker push <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest

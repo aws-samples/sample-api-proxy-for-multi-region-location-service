@@ -27,7 +27,20 @@ function invertMapping(regionFirst, enabledRegions) {
 
 // Read the packaged mapping JSON file and invert+validate it.
 function loadMapping(filePath, enabledRegions) {
-  const regionFirst = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") {
+      throw new Error(
+        `Country-region mapping file not found at ${filePath}. ` +
+          `Create it from the example: ` +
+          `cp config/country-region-map-example.json config/country-region-map.json`
+      );
+    }
+    throw e;
+  }
+  const regionFirst = JSON.parse(raw);
   return invertMapping(regionFirst, enabledRegions);
 }
 

@@ -1,4 +1,8 @@
 node_modules/
 .env
-.kiro
-.vscode
+config/country-region-map.json
+.kiro/
+.vscode/
+.claude/
+docs/superpowers/
+.remember/

@@ -2,8 +2,14 @@ node_modules
 .git
 .kiro
 .vscode
+.claude
+.remember
 infra
+docs
+test
 README.md
+README.zh-CN.md
 Dockerfile
+.env
 .dockerignore
 .gitignore

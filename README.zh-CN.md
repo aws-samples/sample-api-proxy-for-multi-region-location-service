@@ -68,6 +68,14 @@ aws location create-key \
 
 国家→区域映射在 `config/country-region-map.json`（区域优先结构）维护，改后重新部署即可生效（零停机滚动更新）。
 
+> **注意**：真实的 `config/country-region-map.json` 已加入 `.gitignore`（各环境的国家清单可能不同、且视为部署配置），仓库只跟踪示例文件 `config/country-region-map-example.json`。首次使用时需从示例复制一份再按需修改：
+>
+> ```bash
+> cp config/country-region-map-example.json config/country-region-map.json
+> ```
+>
+> 该文件是运行时必需的：应用启动时读取它，缺失会直接启动失败（错误信息会提示执行上面的 `cp` 命令）。`docker build` 也会将其打包进镜像，因此**构建镜像前同样需先准备好该文件**。
+
 ## 部署
 
 ### 0. 将各区域 API Key 存入 Secrets Manager
@@ -113,6 +121,9 @@ aws cloudformation describe-stacks \
 ```bash
 npm install
 
+# 准备国家→区域映射（从示例复制后按需修改）
+cp config/country-region-map-example.json config/country-region-map.json
+
 export HOME_REGION=ap-northeast-1
 export MULTI_REGION_ROUTING=true
 export ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1
@@ -146,7 +157,8 @@ aws ecr create-repository --repository-name location-demo --region <your-region>
 aws ecr get-login-password --region <your-region> | \
   docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com
 
-# 构建并推送
+# 构建并推送（构建前确保已从示例创建 config/country-region-map.json）
+cp -n config/country-region-map-example.json config/country-region-map.json 2>/dev/null || true
 docker build -t location-demo .
 docker tag location-demo:latest <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest
 docker push <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-demo:latest

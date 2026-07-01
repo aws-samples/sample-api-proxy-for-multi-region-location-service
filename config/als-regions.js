@@ -13,6 +13,7 @@ const ALS_SUPPORTED_REGIONS = new Set([
   "eu-west-1",
   "eu-west-2",
   "eu-north-1",
+  "eu-south-2",
   "sa-east-1",
   "ca-central-1",
 ]);
