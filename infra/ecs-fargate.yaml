@@ -39,15 +39,24 @@ Mappings:
       PrefixListId: pl-38a64351
 
 Parameters:
-  LocationApiKeySecretArn:
+  LocationApiKeysSecretArn:
     Type: String
-    Description: Secrets Manager ARN for Location Service API Key
+    Description: "Secrets Manager ARN for the JSON secret {region: apiKey}"
   MapTileDomain:
     Type: String
     Description: CloudFront domain for map tiles (from cloudfront-map-proxy stack)
-  AwsRegion:
+  HomeRegion:
     Type: String
     Default: us-east-1
+    Description: Default/guide ALS region (must be global-coverage if routing on)
+  EnabledRegions:
+    Type: String
+    Default: us-east-1
+    Description: Comma-separated ALS regions in use
+  MultiRegionRouting:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
   ImageUri:
     Type: String
     Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/location-demo:latest)
@@ -201,7 +210,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref LocationApiKeySecretArn
+                Resource: !Ref LocationApiKeysSecretArn
 
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -221,13 +230,17 @@ Resources:
           PortMappings:
             - ContainerPort: 3000
           Environment:
-            - Name: AWS_REGION
-              Value: !Ref AwsRegion
+            - Name: HOME_REGION
+              Value: !Ref HomeRegion
+            - Name: ENABLED_REGIONS
+              Value: !Ref EnabledRegions
+            - Name: MULTI_REGION_ROUTING
+              Value: !Ref MultiRegionRouting
             - Name: MAP_TILE_DOMAIN
               Value: !Ref MapTileDomain
           Secrets:
-            - Name: LOCATION_API_KEY
-              ValueFrom: !Ref LocationApiKeySecretArn
+            - Name: LOCATION_API_KEYS
+              ValueFrom: !Ref LocationApiKeysSecretArn
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -243,6 +256,9 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref DesiredCount
       LaunchType: FARGATE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
