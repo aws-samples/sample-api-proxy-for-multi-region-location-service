@@ -1,6 +1,6 @@
 # Amazon Location Service Proxy
 
-Server-side proxy for address autocomplete + map positioning, built with Amazon Location Service and MapLibre GL JS.
+Server-side proxy for address autocomplete + map positioning, built with Amazon Location Service and MapLibre GL JS. Routes search and map-tile requests to the Amazon Location Service (ALS) region that best matches the request's country — while keeping every API key off the client.
 
 [中文文档](README.zh-CN.md)
 
@@ -13,6 +13,8 @@ Server-side proxy for address autocomplete + map positioning, built with Amazon 
 - The style descriptor is fetched server-side, tile URLs are rewritten, and all key parameters are stripped before returning to the frontend
 - The API Key is stored in AWS Secrets Manager for secure rotation
 
+**Multi-Region Routing**: Different ALS regions carry different map data providers and region-specific optimizations (e.g. GrabMaps in Southeast Asia). This proxy routes each request to the region matching its country, so users get the best local map/search quality. Routing is driven by a country→region mapping and can be toggled on/off with a single switch.
+
 **Auto Scaling to Reduce Cost**: The production environment uses ECS Fargate with Auto Scaling, automatically adjusting the number of service instances based on CPU utilization. Scales down to minimum instances during low traffic and scales out during peak hours, avoiding the cost of fixed capacity. CloudFront edge caching further reduces origin requests and API call costs.
 
 ## Features
@@ -21,82 +23,148 @@ Server-side proxy for address autocomplete + map positioning, built with Amazon 
 - 📍 Browser geolocation (Geolocation API)
 - 🗺️ Interactive map display (MapLibre GL + Amazon Location Map Tiles)
 - 🎨 Map style switching (Standard / Monochrome / Hybrid / Satellite)
+- 🌏 Country-based routing to the matching ALS region (search + map tiles)
+
+## How Multi-Region Routing Works
+
+Each request resolves to a **target region**, then the proxy calls that region's ALS endpoint with that region's key:
+
+```
+Request
+  ├── has countryCode            → look up region in the mapping → target region
+  ├── has lat/lng, no country    → reverse-geocode via HOME_REGION → country → mapping → target region
+  └── nothing / no match / error → HOME_REGION (fallback)
+```
+
+- **`HOME_REGION`** is the default/guide region. It is used to reverse-geocode coordinates into a country, and it is the fallback whenever a country has no mapping. It must be a global-coverage region when routing is on (not a GrabMaps region — `ap-southeast-1` / `ap-southeast-5`), because reverse-geocoding a worldwide coordinate needs global coverage.
+- The **country→region mapping** (`config/country-region-map.json`) is the **single source of truth for which regions are in use**: its top-level keys are the region set. Every key becomes a CloudFront behavior, needs an API key, and is validated at startup.
+- **`HOME_REGION` must appear as a key in the mapping.** A region that only serves as fallback (binds no specific country) is written with an empty list, e.g. `"ap-northeast-1": []`.
+- With routing **off**, every request goes to `HOME_REGION` — identical to a plain single-region proxy.
 
 ## Architecture
 
 ```
 Browser
-  ├── Address search → Express backend → Amazon Location Service (API Key)
-  ├── Map style → Express backend (proxy style descriptor + rewrite tile URLs)
-  └── Map tiles → CloudFront (edge cache + inject API Key) → Amazon Location Service
+  ├── Address search → Express backend → ALS Geo Places (target region, server-side key)
+  ├── Map style      → Express backend (fetch descriptor + rewrite tile URLs to CloudFront)
+  └── Map tiles      → CloudFront /<region>/* (edge cache + inject that region's key) → ALS Geo Maps
 ```
 
 ## Prerequisites
 
 1. An AWS account with Amazon Location Service enabled
-2. One Location Service **API Key per enabled region** (each key needs both `geo-places` and `geo-maps` permissions)
+2. One Location Service **API Key per region in the mapping** (each key needs both `geo-places` and `geo-maps` permissions). Keys are created per region because an ALS API key is region-scoped.
+3. `node` (v20+) and the `aws` CLI (configured with credentials).
 
-### Create an API Key (AWS CLI)
+Two region concepts are used throughout and are intentionally kept distinct:
 
-Run once per region you want to enable (swap `--region` for each region):
+| Term | Meaning |
+|---|---|
+| **deploy region** (`<deploy-region>`) | The single region that hosts your infrastructure: the Secrets Manager secret, the CloudFront stack, the ECS stack, and the ECR repository. |
+| **ALS region** (`<als-region>`) | A region the proxy routes to — one of the keys in the mapping file. There can be several. |
 
-```bash
-aws location create-key \
-  --key-name DemoApiKey-xxx \
-  --restrictions '{
-    "AllowActions":["geo-places:*","geo-maps:*"],
-    "AllowResources":[
-      "arn:aws:geo-maps:<your-region>::provider/*",
-      "arn:aws:geo-places:<your-region>::provider/*"
-    ]}' \
-  --expire-time "2028-08-08T08:08:08Z" \
-  --region <your-region>
-```
+`HOME_REGION` and the deploy region are independent: they can be the same or different (e.g. deploy in Singapore for latency, but set `HOME_REGION=ap-northeast-1` because Singapore is a GrabMaps region and can't be the reverse-geocode guide).
 
 ## Environment Variables
 
-Multi-region routing is configured through the following environment variables:
-
 | Variable | Description | Example |
 |---|---|---|
-| `HOME_REGION` | Default/guide ALS region (must be a global-coverage region when routing is on — not a GrabMaps region ap-southeast-1/5) | `ap-northeast-1` |
-| `MULTI_REGION_ROUTING` | Master switch for multi-region routing; defaults to `false` (= current single-region behavior) | `true` |
-| `ENABLED_REGIONS` | ALS regions in use, comma-separated | `ap-northeast-1,eu-west-1,us-east-1` |
-| `LOCATION_API_KEYS` | JSON secret: region→API Key (each key has geo-places + geo-maps permissions) | `{"ap-northeast-1":"v1.public.xxx"}` |
-| `MAP_TILE_DOMAIN` | CloudFront map-tile domain | `d123.cloudfront.net` |
+| `HOME_REGION` | Default/guide ALS region. Must be a key in the mapping file. When routing is on it must be a global-coverage region (not `ap-southeast-1` / `ap-southeast-5`). | `ap-northeast-1` |
+| `MULTI_REGION_ROUTING` | Master switch; defaults to `false` (single-region: everything uses `HOME_REGION`). | `true` |
+| `LOCATION_API_KEYS` | JSON of region→API Key (each key has geo-places + geo-maps). Provided as one Secrets Manager secret. | `{"ap-northeast-1":"v1.public.xxx"}` |
+| `MAP_TILE_DOMAIN` | CloudFront map-tile domain (output of the CloudFront stack). | `d123.cloudfront.net` |
 
-The country→region mapping is maintained in `config/country-region-map.json` (region-first structure); changing it takes effect after a redeploy (zero-downtime rolling update).
+> The regions in use are **not** an environment variable — they are the keys of `config/country-region-map.json`. Locally these variables are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
 
-> **Note**: The real `config/country-region-map.json` is gitignored (each environment's country list may differ and it is treated as deployment config); the repo only tracks the example file `config/country-region-map-example.json`. On first use, copy it and edit as needed:
->
-> ```bash
-> cp config/country-region-map-example.json config/country-region-map.json
-> ```
->
-> This file is required at runtime: the app reads it on startup and fails fast if missing (the error tells you to run the `cp` above). `docker build` also bakes it into the image, so **it must exist before building the image** too.
+## The Country→Region Mapping File
+
+`config/country-region-map.json` is region-first (`{ region: [ISO country codes] }`) and is the single source of truth for the region set:
+
+```json
+{
+  "ap-northeast-1": [],
+  "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH"],
+  "eu-central-1": ["DE", "FR", "NL", "IE", "ES", "IT"],
+  "us-east-1": ["US", "CA", "MX"]
+}
+```
+
+- Each top-level key is an in-use region (gets a CloudFront behavior, needs a key, is validated at startup).
+- `[]` means "region has no specific country binding" — used for a fallback-only `HOME_REGION`.
+- A country not listed anywhere falls back to `HOME_REGION` at request time (logged, never an error).
+
+The **real** `config/country-region-map.json` is gitignored (the country list is deployment-specific). The repo tracks `config/country-region-map-example.json`. Create your real file from it:
+
+```bash
+cp config/country-region-map-example.json config/country-region-map.json
+```
+
+- **Multi-region**: edit the copy to match your business (regions + countries), keeping `HOME_REGION` as one of the keys.
+- **Single-region**: keep just one region, e.g. `{ "us-east-1": [] }` (all countries fall back to it).
+
+The file is required at runtime: the app reads it on startup and fails fast if missing (the error tells you to run the `cp` above). `docker build` bakes it into the image, so it must exist before building too.
 
 ## Deployment
 
-### 0. Store the per-region API Keys in Secrets Manager
+The steps below are the **same for single-region and multi-region**. Where they differ, a **Single-region** / **Multi-region** note calls it out. Throughout, `<deploy-region>` is your one infrastructure region and `<als-region>` is a region from the mapping.
 
-Store all region keys in a **single JSON secret** (key = region name, value = that region's API Key):
+### 0. Create the mapping file
 
 ```bash
+cp config/country-region-map-example.json config/country-region-map.json
+# then edit config/country-region-map.json for your regions/countries
+```
+
+- **Single-region**: reduce it to one region, e.g. `{ "us-east-1": [] }`.
+- **Multi-region**: list each region and its countries; keep `HOME_REGION` as a key.
+
+### 1. Create the per-region API Keys and store them in Secrets Manager
+
+An ALS API key is region-scoped, so you need one key per region in the mapping. The helper script derives the region set from the mapping file, creates a key in each, assembles the `LOCATION_API_KEYS` JSON, and (with `--write-secret`) stores it in Secrets Manager:
+
+```bash
+scripts/create-api-keys.sh \
+  --mapping-file config/country-region-map.json \
+  --secret-name location-proxy/api-keys \
+  --deploy-region <deploy-region> \
+  --write-secret
+```
+
+Without `--write-secret` the script only prints the JSON to stdout so you can review it first. It creates one key named `ProxyApiKey-<als-region>` per region. This works for both single- and multi-region (single-region just has one region → one key).
+
+<details>
+<summary>Prefer to do it manually?</summary>
+
+Run once per `<als-region>` in your mapping, then combine the keys into one JSON secret yourself:
+
+```bash
+aws location create-key \
+  --key-name ProxyApiKey-<als-region> \
+  --restrictions '{
+    "AllowActions":["geo-places:*","geo-maps:*"],
+    "AllowResources":[
+      "arn:aws:geo-maps:<als-region>::provider/*",
+      "arn:aws:geo-places:<als-region>::provider/*"
+    ]}' \
+  --expire-time "2028-08-08T08:08:08Z" \
+  --region <als-region>
+
 aws secretsmanager create-secret \
   --name location-proxy/api-keys \
-  --secret-string '{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy"}' \
+  --secret-string '{"<als-region-1>":"v1.public.xxx","<als-region-2>":"v1.public.yyy"}' \
   --region <deploy-region>
 ```
+</details>
 
-### 1. Generate and Deploy the CloudFront Map Tile Proxy
+### 2. Generate and deploy the CloudFront map-tile proxy
 
-The CloudFront template `infra/cloudfront-map-proxy.yaml` is generated from `ENABLED_REGIONS` (per region: an origin, a `/<region>/*` behavior, and a CloudFront Function that injects that region's key at the edge and strips the region path prefix). Generate the template first:
+The CloudFront template `infra/cloudfront-map-proxy.yaml` is generated from the mapping file (per region: an origin, a `/<region>/*` behavior, and a CloudFront Function that injects that region's key at the edge and strips the region path prefix):
 
 ```bash
-ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1 node scripts/generate-cloudfront-template.js
+node scripts/generate-cloudfront-template.js
 ```
 
-The generated template reads the JSON secret from the previous step directly via `{{resolve:secretsmanager:location-proxy/api-keys:SecretString:<region>}}`, so no parameters are needed. Then deploy:
+The generated template reads the JSON secret directly via `{{resolve:secretsmanager:location-proxy/api-keys:SecretString:<region>}}`, so no parameters are needed. Deploy it in your deploy region:
 
 ```bash
 aws cloudformation deploy \
@@ -105,65 +173,65 @@ aws cloudformation deploy \
   --region <deploy-region>
 ```
 
-Get the CloudFront domain after deployment:
+Get the CloudFront domain (this is your `MAP_TILE_DOMAIN`):
 
 ```bash
 aws cloudformation describe-stacks \
   --stack-name location-map-proxy \
   --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontDomain`].OutputValue' \
   --output text \
-  --region <your-region>
+  --region <deploy-region>
 ```
 
-### 2. Start the Application
+### 3. Run the application
+
+#### Locally
 
 ```bash
 npm install
-
-# Prepare the country→region mapping (copy from the example, then edit as needed)
-cp config/country-region-map-example.json config/country-region-map.json
+# (mapping file already created in step 0)
 
 export HOME_REGION=ap-northeast-1
-export MULTI_REGION_ROUTING=true
-export ENABLED_REGIONS=ap-northeast-1,eu-west-1,us-east-1
-export LOCATION_API_KEYS='{"ap-northeast-1":"v1.public.xxx","eu-west-1":"v1.public.yyy","us-east-1":"v1.public.zzz"}'
-export MAP_TILE_DOMAIN=d1234567890.cloudfront.net  # domain from previous step
+export MULTI_REGION_ROUTING=true   # single-region: false
+export LOCATION_API_KEYS='{"ap-northeast-1":"v1.public.xxx","eu-central-1":"v1.public.yyy"}'
+export MAP_TILE_DOMAIN=d1234567890.cloudfront.net   # from step 2
 
 npm start
 ```
 
-To keep the current single-region behavior, set `MULTI_REGION_ROUTING` to `false` (the default) and point `HOME_REGION` / `ENABLED_REGIONS` at the same region.
+> `LOCATION_API_KEYS` must contain an entry for **every region in your mapping file** (the example above shows two regions — match yours). A missing key fails startup validation. The `create-api-keys.sh` script in step 1 assembles this JSON for you.
 
 Open http://localhost:3000
 
-## Production Deployment (CloudFront + ALB + ECS Fargate)
+- **Single-region**: set `MULTI_REGION_ROUTING=false` and put a single region in the mapping and in `LOCATION_API_KEYS`.
 
-High-availability architecture: CloudFront edge acceleration + ALB + multi-AZ ECS Fargate + Auto Scaling.
+#### Production (CloudFront + ALB + ECS Fargate)
+
+High-availability architecture: CloudFront edge acceleration + ALB + multi-AZ ECS Fargate + Auto Scaling. Configuration is passed as CloudFormation parameters (not `export`).
 
 ```
 Browser
   ├── Static assets → CloudFront (edge cache) → ALB → ECS Fargate
-  ├── API requests → CloudFront (AWS backbone) → ALB → ECS Fargate → Amazon Location Service
-  └── Map tiles → CloudFront (edge cache + inject API Key) → Amazon Location Service
+  ├── API requests  → CloudFront (AWS backbone) → ALB → ECS Fargate → Amazon Location Service
+  └── Map tiles     → CloudFront (edge cache + inject API Key) → Amazon Location Service
 ```
 
-### 1. Create an ECR Repository and Push the Image
+**a. Create an ECR repository and push the image** (in your deploy region):
 
 ```bash
-aws ecr create-repository --repository-name location-proxy --region <your-region>
+aws ecr create-repository --repository-name location-proxy --region <deploy-region>
 
 # Log in to ECR
-aws ecr get-login-password --region <your-region> | \
-  docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com
+aws ecr get-login-password --region <deploy-region> | \
+  docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com
 
-# Build and push (ensure config/country-region-map.json exists, created from the example)
-cp -n config/country-region-map-example.json config/country-region-map.json 2>/dev/null || true
+# Build and push (config/country-region-map.json must exist — it is baked into the image)
 docker build -t location-proxy .
-docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-proxy:latest
-docker push <ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/location-proxy:latest
+docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 ```
 
-### 2. Deploy the ECS Fargate Stack
+**b. Deploy the ECS Fargate stack** (in your deploy region). The regions come from the mapping file baked into the image, so only `HomeRegion` / `MultiRegionRouting` / the secret / domain / image are passed:
 
 ```bash
 aws cloudformation deploy \
@@ -173,19 +241,30 @@ aws cloudformation deploy \
   --parameter-overrides \
     LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-proxy/api-keys-XXXXXX \
     HomeRegion=ap-northeast-1 \
-    EnabledRegions=ap-northeast-1,eu-west-1,us-east-1 \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
     ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
   --region <deploy-region>
 ```
 
-### 3. Get the Access URL
+- **Single-region**: set `MultiRegionRouting=false` and `HomeRegion` to your one region.
+
+**c. Get the access URL**:
 
 ```bash
 aws cloudformation describe-stacks \
   --stack-name location-proxy-ecs \
   --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' \
   --output text \
-  --region <your-region>
+  --region <deploy-region>
+```
+
+## Updating the country→region mapping
+
+Edit `config/country-region-map.json`, then redeploy (rebuild image → push → `cloudformation deploy`). ECS performs a zero-downtime rolling update. If you added a **new region**, first create its key and update the secret (rerun step 1) and regenerate + redeploy the CloudFront stack (step 2). A misconfigured mapping fails the startup validation, so the new task never becomes healthy and the old version keeps serving.
+
+## Tests
+
+```bash
+npm test
 ```

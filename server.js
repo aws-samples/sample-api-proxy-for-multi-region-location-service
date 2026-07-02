@@ -112,8 +112,10 @@ async function detectStyles(als, config) {
 }
 
 async function main() {
-  const config = loadConfig(); // throws on invalid config → process exits non-zero
-  const mappingStore = createMappingStore(MAPPING_FILE, config.enabledRegions);
+  // The mapping file is the single source of truth for the region set, so it is
+  // loaded first; its regions feed config validation (throws → process exits).
+  const mappingStore = createMappingStore(MAPPING_FILE);
+  const config = loadConfig(process.env, mappingStore.regions);
   const als = createAlsClient();
   const reverseGeocoder = createReverseGeocoder({
     homeRegion: config.homeRegion,
@@ -127,7 +129,7 @@ async function main() {
     console.log(`🗺️  Proxy running at http://localhost:${PORT}`);
     console.log(`   HOME_REGION: ${config.homeRegion}`);
     console.log(`   MULTI_REGION_ROUTING: ${config.routingEnabled}`);
-    console.log(`   ENABLED_REGIONS: ${[...config.enabledRegions].join(", ")}`);
+    console.log(`   Regions (from mapping): ${[...config.enabledRegions].join(", ")}`);
     console.log(`   Mapping entries: ${mappingStore.size}`);
     console.log(`   Available styles: ${availableStyles.map((s) => s.id).join(", ")}`);
   });

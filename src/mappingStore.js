@@ -2,16 +2,19 @@ const fs = require("fs");
 const { ALS_SUPPORTED_REGIONS } = require("../config/als-regions");
 
 // Invert a region-first mapping ({region: [country,...]}) into a
-// country->region Map. Validates regions and rejects duplicate countries.
-function invertMapping(regionFirst, enabledRegions) {
+// country->region Map. The region set is the mapping's top-level keys, so the
+// file is the single source of truth for which regions are in use. A region
+// may map to [] (no country binding) when it exists only as the fallback /
+// reverse-geocode guide region. Validates ALS support and rejects duplicate
+// countries. Returns { map, regions }.
+function invertMapping(regionFirst) {
   const map = new Map();
+  const regions = new Set();
   for (const [region, countries] of Object.entries(regionFirst)) {
     if (!ALS_SUPPORTED_REGIONS.has(region)) {
       throw new Error(`Mapping region "${region}" is not an ALS-supported region`);
     }
-    if (!enabledRegions.has(region)) {
-      throw new Error(`Mapping region "${region}" is not in ENABLED_REGIONS`);
-    }
+    regions.add(region);
     for (const raw of countries) {
       const cc = String(raw).toUpperCase();
       if (map.has(cc)) {
@@ -22,11 +25,12 @@ function invertMapping(regionFirst, enabledRegions) {
       map.set(cc, region);
     }
   }
-  return map;
+  return { map, regions };
 }
 
 // Read the packaged mapping JSON file and invert+validate it.
-function loadMapping(filePath, enabledRegions) {
+// Returns { map, regions }.
+function loadMapping(filePath) {
   let raw;
   try {
     raw = fs.readFileSync(filePath, "utf8");
@@ -41,17 +45,18 @@ function loadMapping(filePath, enabledRegions) {
     throw e;
   }
   const regionFirst = JSON.parse(raw);
-  return invertMapping(regionFirst, enabledRegions);
+  return invertMapping(regionFirst);
 }
 
-// Build a store object with a getRegion(countryCode) lookup.
-function createMappingStore(filePath, enabledRegions) {
-  const map = loadMapping(filePath, enabledRegions);
+// Build a store with a getRegion(countryCode) lookup and the region set.
+function createMappingStore(filePath) {
+  const { map, regions } = loadMapping(filePath);
   return {
     getRegion(countryCode) {
       if (!countryCode) return null;
       return map.get(String(countryCode).toUpperCase()) || null;
     },
+    regions,
     size: map.size,
   };
 }

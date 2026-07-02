@@ -48,11 +48,7 @@ Parameters:
   HomeRegion:
     Type: String
     Default: us-east-1
-    Description: Default/guide ALS region (must be global-coverage if routing on)
-  EnabledRegions:
-    Type: String
-    Default: us-east-1
-    Description: Comma-separated ALS regions in use
+    Description: Default/guide ALS region (must be global-coverage if routing on; must be a key in the mapping file)
   MultiRegionRouting:
     Type: String
     Default: "false"
@@ -232,8 +228,6 @@ Resources:
           Environment:
             - Name: HOME_REGION
               Value: !Ref HomeRegion
-            - Name: ENABLED_REGIONS
-              Value: !Ref EnabledRegions
             - Name: MULTI_REGION_ROUTING
               Value: !Ref MultiRegionRouting
             - Name: MAP_TILE_DOMAIN
