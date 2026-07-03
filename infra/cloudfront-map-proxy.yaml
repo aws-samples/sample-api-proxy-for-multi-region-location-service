@@ -135,7 +135,7 @@ Resources:
     Type: AWS::CloudFront::CachePolicy
     Properties:
       CachePolicyConfig:
-        Name: !Sub "${AWS::StackName}-MapTileCache"
+        Name: !Sub "${AWS::StackName}-MapTileCache-v1"
         DefaultTTL: 86400
         MaxTTL: 604800
         MinTTL: 3600
@@ -150,7 +150,7 @@ Resources:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
       OriginRequestPolicyConfig:
-        Name: !Sub "${AWS::StackName}-ForwardApiKey"
+        Name: !Sub "${AWS::StackName}-ForwardApiKey-v1"
         CookiesConfig: { CookieBehavior: none }
         HeadersConfig: { HeaderBehavior: none }
         QueryStringsConfig:

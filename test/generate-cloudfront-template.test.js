@@ -21,3 +21,15 @@ test("edge function strips the region path prefix before forwarding", () => {
   const tpl = buildTemplate(["eu-west-1"], "s");
   assert.match(tpl, /request\.uri = request\.uri\.slice\('\/eu-west-1'\.length\);/);
 });
+
+test("policy suffix makes account-global policy names unique", () => {
+  const tpl = buildTemplate(["eu-west-1"], "s", "ab12cd");
+  assert.match(tpl, /Name: !Sub "\$\{AWS::StackName\}-MapTileCache-ab12cd"/);
+  assert.match(tpl, /Name: !Sub "\$\{AWS::StackName\}-ForwardApiKey-ab12cd"/);
+});
+
+test("no suffix keeps the base policy names (backward compatible)", () => {
+  const tpl = buildTemplate(["eu-west-1"], "s");
+  assert.match(tpl, /Name: !Sub "\$\{AWS::StackName\}-MapTileCache"/);
+  assert.match(tpl, /Name: !Sub "\$\{AWS::StackName\}-ForwardApiKey"/);
+});

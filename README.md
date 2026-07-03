@@ -164,6 +164,8 @@ The CloudFront template `infra/cloudfront-map-proxy.yaml` is generated from the 
 node scripts/generate-cloudfront-template.js
 ```
 
+The template's CachePolicy / OriginRequestPolicy names are account-global (CloudFront is a global service), so the generator appends a short random suffix to avoid `AlreadyExists` collisions across stacks, regions, or redeploys. Set `POLICY_NAME_SUFFIX` to pin it (e.g. for reproducible output): `POLICY_NAME_SUFFIX=v1 node scripts/generate-cloudfront-template.js`.
+
 The generated template reads the JSON secret directly via `{{resolve:secretsmanager:location-proxy/api-keys:SecretString:<region>}}`, so no parameters are needed. Deploy it in your deploy region:
 
 ```bash

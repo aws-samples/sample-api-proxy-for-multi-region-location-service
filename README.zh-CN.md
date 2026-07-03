@@ -164,6 +164,8 @@ CloudFront 模板 `infra/cloudfront-map-proxy.yaml` 由映射文件生成（每�
 node scripts/generate-cloudfront-template.js
 ```
 
+模板里的 CachePolicy / OriginRequestPolicy 名称是账号级全局唯一的（CloudFront 是全局服务），因此生成器会自动追加一个短随机后缀，避免跨 stack、跨区域或重复部署时出现 `AlreadyExists` 冲突。可用 `POLICY_NAME_SUFFIX` 固定它（如需可复现的输出）：`POLICY_NAME_SUFFIX=v1 node scripts/generate-cloudfront-template.js`。
+
 生成的模板会通过 `{{resolve:secretsmanager:location-proxy/api-keys:SecretString:<region>}}` 直接读取 JSON secret，无需再传参。在部署区域部署：
 
 ```bash

@@ -57,11 +57,16 @@ function behaviorResource(region) {
 `;
 }
 
-function buildTemplate(regions, secretName) {
+// CachePolicy / OriginRequestPolicy names are account-global (CloudFront is a
+// global service), so a fixed name collides across stacks/regions/redeploys.
+// policySuffix makes them unique. It is passed in (not generated here) so this
+// function stays pure and testable; main() supplies a random one.
+function buildTemplate(regions, secretName, policySuffix = "") {
   const functions = regions.map((r) => functionResource(r, secretName)).join("\n");
   const origins = regions.map(originResource).join("");
   const behaviors = regions.map(behaviorResource).join("");
   const firstName = pascal(regions[0]);
+  const suffix = policySuffix ? `-${policySuffix}` : "";
   return `AWSTemplateFormatVersion: "2010-09-09"
 Description: CloudFront proxy for ALS map tiles (multi-region) - GENERATED, do not edit by hand
 
@@ -74,7 +79,7 @@ ${functions}
     Type: AWS::CloudFront::CachePolicy
     Properties:
       CachePolicyConfig:
-        Name: !Sub "\${AWS::StackName}-MapTileCache"
+        Name: !Sub "\${AWS::StackName}-MapTileCache${suffix}"
         DefaultTTL: 86400
         MaxTTL: 604800
         MinTTL: 3600
@@ -89,7 +94,7 @@ ${functions}
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
       OriginRequestPolicyConfig:
-        Name: !Sub "\${AWS::StackName}-ForwardApiKey"
+        Name: !Sub "\${AWS::StackName}-ForwardApiKey${suffix}"
         CookiesConfig: { CookieBehavior: none }
         HeadersConfig: { HeaderBehavior: none }
         QueryStringsConfig:
@@ -138,10 +143,14 @@ function main() {
     console.error(`Mapping file ${mappingFile} declares no regions`);
     process.exit(1);
   }
+  // Random suffix so the account-global policy names don't collide across
+  // stacks/regions/redeploys. Overridable for reproducibility.
+  const policySuffix =
+    process.env.POLICY_NAME_SUFFIX || Math.random().toString(36).slice(2, 8);
   const out = path.join(__dirname, "..", "infra", "cloudfront-map-proxy.yaml");
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, buildTemplate(regions, secretName));
-  console.log(`Wrote ${out} for regions: ${regions.join(", ")}`);
+  fs.writeFileSync(out, buildTemplate(regions, secretName, policySuffix));
+  console.log(`Wrote ${out} for regions: ${regions.join(", ")} (policy suffix: ${policySuffix})`);
 }
 
 if (require.main === module) main();
