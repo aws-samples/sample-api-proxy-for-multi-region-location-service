@@ -164,7 +164,7 @@ Resources:
         Enabled: true
         Comment: ALS Map Tile Proxy (multi-region)
         DefaultCacheBehavior:
-          TargetOriginId: ApSoutheast1Origin
+          TargetOriginId: ApNortheast1Origin
           ViewerProtocolPolicy: https-only
           CachePolicyId: !Ref CachePolicy
           OriginRequestPolicyId: !Ref OriginRequestPolicy
@@ -173,7 +173,7 @@ Resources:
           Compress: true
           FunctionAssociations:
             - EventType: viewer-request
-              FunctionARN: !GetAtt ApSoutheast1AppendKeyFunction.FunctionMetadata.FunctionARN
+              FunctionARN: !GetAtt ApNortheast1AppendKeyFunction.FunctionMetadata.FunctionARN
         CacheBehaviors:
           - PathPattern: /ap-southeast-1/*
             TargetOriginId: ApSoutheast1Origin

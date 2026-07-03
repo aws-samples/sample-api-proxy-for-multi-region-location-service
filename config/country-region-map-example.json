@@ -1,6 +1,6 @@
 {
   "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH", "MM", "KH"],
-  "ap-northeast-1": ["JP", "KR", "MN", "TW", "HK", "MO", "BN"],
+  "ap-northeast-1": ["*", "JP", "KR", "MN", "TW", "HK", "MO", "BN"],
   "ap-southeast-2": ["AU", "NZ"],
   "ap-south-1": ["IN", "BD", "LK", "NP", "PK"],
   "eu-central-1": ["FR", "DE", "NL", "IE", "BE", "LU", "AT", "CH", "ES", "IT"],

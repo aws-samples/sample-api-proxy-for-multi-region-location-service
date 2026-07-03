@@ -3,19 +3,35 @@ const { ALS_SUPPORTED_REGIONS } = require("../config/als-regions");
 
 // Invert a region-first mapping ({region: [country,...]}) into a
 // country->region Map. The region set is the mapping's top-level keys, so the
-// file is the single source of truth for which regions are in use. A region
-// may map to [] (no country binding) when it exists only as the fallback /
-// reverse-geocode guide region. Validates ALS support and rejects duplicate
-// countries. Returns { map, regions }.
+// file is the single source of truth for which regions are in use.
+//
+// Exactly one region must include the "*" wildcard in its country list. That
+// marks the HOME region: the fallback for unmatched countries and the reverse-
+// geocode guide region. "*" is not a country; the home region may also serve
+// specific countries (e.g. ["*", "JP"]).
+//
+// Validates ALS support, rejects duplicate countries, and requires exactly one
+// home region. Returns { map, regions, homeRegion }.
 function invertMapping(regionFirst) {
   const map = new Map();
   const regions = new Set();
+  let homeRegion = null;
   for (const [region, countries] of Object.entries(regionFirst)) {
     if (!ALS_SUPPORTED_REGIONS.has(region)) {
       throw new Error(`Mapping region "${region}" is not an ALS-supported region`);
     }
     regions.add(region);
     for (const raw of countries) {
+      if (raw === "*") {
+        if (homeRegion) {
+          throw new Error(
+            `Mapping has multiple home regions ("*"): "${homeRegion}" and "${region}" ` +
+              `(exactly one region may be marked "*")`
+          );
+        }
+        homeRegion = region;
+        continue;
+      }
       const cc = String(raw).toUpperCase();
       if (map.has(cc)) {
         throw new Error(
@@ -25,11 +41,17 @@ function invertMapping(regionFirst) {
       map.set(cc, region);
     }
   }
-  return { map, regions };
+  if (!homeRegion) {
+    throw new Error(
+      `Mapping has no home region: exactly one region must include "*" in its ` +
+        `country list (marks the fallback / reverse-geocode guide region)`
+    );
+  }
+  return { map, regions, homeRegion };
 }
 
 // Read the packaged mapping JSON file and invert+validate it.
-// Returns { map, regions }.
+// Returns { map, regions, homeRegion }.
 function loadMapping(filePath) {
   let raw;
   try {
@@ -48,15 +70,17 @@ function loadMapping(filePath) {
   return invertMapping(regionFirst);
 }
 
-// Build a store with a getRegion(countryCode) lookup and the region set.
+// Build a store with a getRegion(countryCode) lookup, the region set, and the
+// home region (all derived from the mapping file — the single source of truth).
 function createMappingStore(filePath) {
-  const { map, regions } = loadMapping(filePath);
+  const { map, regions, homeRegion } = loadMapping(filePath);
   return {
     getRegion(countryCode) {
       if (!countryCode) return null;
       return map.get(String(countryCode).toUpperCase()) || null;
     },
     regions,
+    homeRegion,
     size: map.size,
   };
 }

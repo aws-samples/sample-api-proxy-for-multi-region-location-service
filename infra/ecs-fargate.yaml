@@ -45,10 +45,6 @@ Parameters:
   MapTileDomain:
     Type: String
     Description: CloudFront domain for map tiles (from cloudfront-map-proxy stack)
-  HomeRegion:
-    Type: String
-    Default: us-east-1
-    Description: Default/guide ALS region (must be global-coverage if routing on; must be a key in the mapping file)
   MultiRegionRouting:
     Type: String
     Default: "false"
@@ -226,8 +222,6 @@ Resources:
           PortMappings:
             - ContainerPort: 3000
           Environment:
-            - Name: HOME_REGION
-              Value: !Ref HomeRegion
             - Name: MULTI_REGION_ROUTING
               Value: !Ref MultiRegionRouting
             - Name: MAP_TILE_DOMAIN

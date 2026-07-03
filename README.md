@@ -32,14 +32,14 @@ Each request resolves to a **target region**, then the proxy calls that region's
 ```
 Request
   ├── has countryCode            → look up region in the mapping → target region
-  ├── has lat/lng, no country    → reverse-geocode via HOME_REGION → country → mapping → target region
-  └── nothing / no match / error → HOME_REGION (fallback)
+  ├── has lat/lng, no country    → reverse-geocode via home region → country → mapping → target region
+  └── nothing / no match / error → home region (fallback)
 ```
 
-- **`HOME_REGION`** is the default/guide region. It is used to reverse-geocode coordinates into a country, and it is the fallback whenever a country has no mapping. It must be a global-coverage region when routing is on (not a GrabMaps region — `ap-southeast-1` / `ap-southeast-5`), because reverse-geocoding a worldwide coordinate needs global coverage.
-- The **country→region mapping** (`config/country-region-map.json`) is the **single source of truth for which regions are in use**: its top-level keys are the region set. Every key becomes a CloudFront behavior, needs an API key, and is validated at startup.
-- **`HOME_REGION` must appear as a key in the mapping.** A region that only serves as fallback (binds no specific country) is written with an empty list, e.g. `"ap-northeast-1": []`.
-- With routing **off**, every request goes to `HOME_REGION` — identical to a plain single-region proxy.
+- The **country→region mapping** (`config/country-region-map.json`) is the **single source of truth**: its top-level keys are the region set (every key becomes a CloudFront behavior, needs an API key, and is validated at startup), and one region is marked **home** with a `"*"` in its country list.
+- The **home region** is the default/guide region: it reverse-geocodes coordinates into a country and is the fallback whenever a country has no mapping. It is chosen by putting `"*"` in that region's country list (e.g. `"ap-northeast-1": ["*"]`, or `["*", "JP"]` if it also serves specific countries). Exactly one region must be marked. There is no `HOME_REGION` environment variable — the mapping defines it.
+- The home region must be a global-coverage region when routing is on (not a GrabMaps region — `ap-southeast-1` / `ap-southeast-5`), because reverse-geocoding a worldwide coordinate needs global coverage.
+- With routing **off**, every request goes to the home region — identical to a plain single-region proxy.
 
 ## Architecture
 
@@ -63,26 +63,25 @@ Two region concepts are used throughout and are intentionally kept distinct:
 | **deploy region** (`<deploy-region>`) | The single region that hosts your infrastructure: the Secrets Manager secret, the CloudFront stack, the ECS stack, and the ECR repository. |
 | **ALS region** (`<als-region>`) | A region the proxy routes to — one of the keys in the mapping file. There can be several. |
 
-`HOME_REGION` and the deploy region are independent: they can be the same or different (e.g. deploy in Singapore for latency, but set `HOME_REGION=ap-northeast-1` because Singapore is a GrabMaps region and can't be the reverse-geocode guide).
+The home region and the deploy region are independent: they can be the same or different (e.g. deploy in Singapore for latency, but mark `ap-northeast-1` as home with `"*"` because Singapore is a GrabMaps region and can't be the reverse-geocode guide).
 
 ## Environment Variables
 
 | Variable | Description | Example |
 |---|---|---|
-| `HOME_REGION` | Default/guide ALS region. Must be a key in the mapping file. When routing is on it must be a global-coverage region (not `ap-southeast-1` / `ap-southeast-5`). | `ap-northeast-1` |
-| `MULTI_REGION_ROUTING` | Master switch; defaults to `false` (single-region: everything uses `HOME_REGION`). | `true` |
+| `MULTI_REGION_ROUTING` | Master switch; defaults to `false` (single-region: everything uses the home region). | `true` |
 | `LOCATION_API_KEYS` | JSON of region→API Key (each key has geo-places + geo-maps). Provided as one Secrets Manager secret. | `{"ap-northeast-1":"v1.public.xxx"}` |
 | `MAP_TILE_DOMAIN` | CloudFront map-tile domain (output of the CloudFront stack). | `d123.cloudfront.net` |
 
-> The regions in use are **not** an environment variable — they are the keys of `config/country-region-map.json`. Locally these variables are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
+> The regions in use **and the home region** are **not** environment variables — they come from `config/country-region-map.json` (its keys, and the `"*"`-marked region). Locally the variables above are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
 
 ## The Country→Region Mapping File
 
-`config/country-region-map.json` is region-first (`{ region: [ISO country codes] }`) and is the single source of truth for the region set:
+`config/country-region-map.json` is region-first (`{ region: [ISO country codes] }`) and is the single source of truth for both the region set and the home region:
 
 ```json
 {
-  "ap-northeast-1": [],
+  "ap-northeast-1": ["*", "JP", "KR"],
   "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH"],
   "eu-central-1": ["DE", "FR", "NL", "IE", "ES", "IT"],
   "us-east-1": ["US", "CA", "MX"]
@@ -90,8 +89,8 @@ Two region concepts are used throughout and are intentionally kept distinct:
 ```
 
 - Each top-level key is an in-use region (gets a CloudFront behavior, needs a key, is validated at startup).
-- `[]` means "region has no specific country binding" — used for a fallback-only `HOME_REGION`.
-- A country not listed anywhere falls back to `HOME_REGION` at request time (logged, never an error).
+- Exactly one region must include `"*"` in its country list — that marks the **home region** (fallback + reverse-geocode guide). It may also serve specific countries (as above) or be fallback-only (`"ap-northeast-1": ["*"]`).
+- A country not listed anywhere falls back to the home region at request time (logged, never an error).
 
 The **real** `config/country-region-map.json` is gitignored (the country list is deployment-specific). The repo tracks `config/country-region-map-example.json`. Create your real file from it:
 
@@ -99,8 +98,8 @@ The **real** `config/country-region-map.json` is gitignored (the country list is
 cp config/country-region-map-example.json config/country-region-map.json
 ```
 
-- **Multi-region**: edit the copy to match your business (regions + countries), keeping `HOME_REGION` as one of the keys.
-- **Single-region**: keep just one region, e.g. `{ "us-east-1": [] }` (all countries fall back to it).
+- **Multi-region**: edit the copy to match your business (regions + countries), keeping exactly one region marked `"*"` as home.
+- **Single-region**: keep just one region, marked home, e.g. `{ "us-east-1": ["*"] }` (all countries fall back to it).
 
 The file is required at runtime: the app reads it on startup and fails fast if missing (the error tells you to run the `cp` above). `docker build` bakes it into the image, so it must exist before building too.
 
@@ -115,8 +114,8 @@ cp config/country-region-map-example.json config/country-region-map.json
 # then edit config/country-region-map.json for your regions/countries
 ```
 
-- **Single-region**: reduce it to one region, e.g. `{ "us-east-1": [] }`.
-- **Multi-region**: list each region and its countries; keep `HOME_REGION` as a key.
+- **Single-region**: reduce it to one region, marked home, e.g. `{ "us-east-1": ["*"] }`.
+- **Multi-region**: list each region and its countries; mark exactly one region home with `"*"`.
 
 ### 1. Create the per-region API Keys and store them in Secrets Manager
 
@@ -191,9 +190,8 @@ aws cloudformation describe-stacks \
 
 ```bash
 npm install
-# (mapping file already created in step 0)
+# (mapping file already created in step 0; the "*"-marked region is the home region)
 
-export HOME_REGION=ap-northeast-1
 export MULTI_REGION_ROUTING=true   # single-region: false
 export LOCATION_API_KEYS='{"ap-northeast-1":"v1.public.xxx","eu-central-1":"v1.public.yyy"}'
 export MAP_TILE_DOMAIN=d1234567890.cloudfront.net   # from step 2
@@ -233,7 +231,7 @@ docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.
 docker push <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 ```
 
-**b. Deploy the ECS Fargate stack** (in your deploy region). The regions come from the mapping file baked into the image, so only `HomeRegion` / `MultiRegionRouting` / the secret / domain / image are passed:
+**b. Deploy the ECS Fargate stack** (in your deploy region). The regions and the home region both come from the mapping file baked into the image, so only `MultiRegionRouting` / the secret / domain / image are passed:
 
 ```bash
 aws cloudformation deploy \
@@ -242,14 +240,13 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-proxy/api-keys-XXXXXX \
-    HomeRegion=ap-northeast-1 \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
     ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
   --region <deploy-region>
 ```
 
-- **Single-region**: set `MultiRegionRouting=false` and `HomeRegion` to your one region.
+- **Single-region**: set `MultiRegionRouting=false` (the home region is whatever you marked `"*"` in the mapping).
 
 **c. Get the access URL**:
 

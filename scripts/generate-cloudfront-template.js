@@ -61,11 +61,14 @@ function behaviorResource(region) {
 // global service), so a fixed name collides across stacks/regions/redeploys.
 // policySuffix makes them unique. It is passed in (not generated here) so this
 // function stays pure and testable; main() supplies a random one.
-function buildTemplate(regions, secretName, policySuffix = "") {
+function buildTemplate(regions, secretName, policySuffix = "", homeRegion = regions[0]) {
   const functions = regions.map((r) => functionResource(r, secretName)).join("\n");
   const origins = regions.map(originResource).join("");
   const behaviors = regions.map(behaviorResource).join("");
-  const firstName = pascal(regions[0]);
+  // The DefaultCacheBehavior handles URIs without a known /<region>/ prefix
+  // (e.g. hand-typed paths). It must point at the HOME region — the designed
+  // fallback — not an arbitrary regions[0].
+  const defaultName = pascal(homeRegion);
   const suffix = policySuffix ? `-${policySuffix}` : "";
   return `AWSTemplateFormatVersion: "2010-09-09"
 Description: CloudFront proxy for ALS map tiles (multi-region) - GENERATED, do not edit by hand
@@ -108,7 +111,7 @@ ${functions}
         Enabled: true
         Comment: ALS Map Tile Proxy (multi-region)
         DefaultCacheBehavior:
-          TargetOriginId: ${firstName}Origin
+          TargetOriginId: ${defaultName}Origin
           ViewerProtocolPolicy: https-only
           CachePolicyId: !Ref CachePolicy
           OriginRequestPolicyId: !Ref OriginRequestPolicy
@@ -117,7 +120,7 @@ ${functions}
           Compress: true
           FunctionAssociations:
             - EventType: viewer-request
-              FunctionARN: !GetAtt ${firstName}AppendKeyFunction.FunctionMetadata.FunctionARN
+              FunctionARN: !GetAtt ${defaultName}AppendKeyFunction.FunctionMetadata.FunctionARN
         CacheBehaviors:
 ${behaviors}        Origins:
 ${origins}
@@ -138,7 +141,8 @@ function main() {
     path.join(__dirname, "..", "config", "country-region-map.json");
   const secretName = process.env.LOCATION_API_KEYS_SECRET_NAME || "location-proxy/api-keys";
 
-  const regions = [...createMappingStore(mappingFile).regions];
+  const store = createMappingStore(mappingFile);
+  const regions = [...store.regions];
   if (!regions.length) {
     console.error(`Mapping file ${mappingFile} declares no regions`);
     process.exit(1);
@@ -149,8 +153,11 @@ function main() {
     process.env.POLICY_NAME_SUFFIX || Math.random().toString(36).slice(2, 8);
   const out = path.join(__dirname, "..", "infra", "cloudfront-map-proxy.yaml");
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, buildTemplate(regions, secretName, policySuffix));
-  console.log(`Wrote ${out} for regions: ${regions.join(", ")} (policy suffix: ${policySuffix})`);
+  fs.writeFileSync(out, buildTemplate(regions, secretName, policySuffix, store.homeRegion));
+  console.log(
+    `Wrote ${out} for regions: ${regions.join(", ")} ` +
+      `(home: ${store.homeRegion}, policy suffix: ${policySuffix})`
+  );
 }
 
 if (require.main === module) main();

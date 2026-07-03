@@ -112,10 +112,14 @@ async function detectStyles(als, config) {
 }
 
 async function main() {
-  // The mapping file is the single source of truth for the region set, so it is
-  // loaded first; its regions feed config validation (throws → process exits).
+  // The mapping file is the single source of truth for both the region set and
+  // the home region (its "*" marker), so it is loaded first; both feed config
+  // validation (throws → process exits).
   const mappingStore = createMappingStore(MAPPING_FILE);
-  const config = loadConfig(process.env, mappingStore.regions);
+  const config = loadConfig(process.env, {
+    regions: mappingStore.regions,
+    homeRegion: mappingStore.homeRegion,
+  });
   const als = createAlsClient();
   const reverseGeocoder = createReverseGeocoder({
     homeRegion: config.homeRegion,

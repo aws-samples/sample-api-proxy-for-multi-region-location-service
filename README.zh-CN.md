@@ -32,14 +32,14 @@
 ```
 请求
   ├── 带 countryCode            → 在映射中查区域 → 目标区域
-  ├── 带 lat/lng、无国家         → 用 HOME_REGION 反解经纬度得国家 → 查映射 → 目标区域
-  └── 无输入 / 未匹配 / 出错      → HOME_REGION（回落）
+  ├── 带 lat/lng、无国家         → 用 home 区域反解经纬度得国家 → 查映射 → 目标区域
+  └── 无输入 / 未匹配 / 出错      → home 区域（回落）
 ```
 
-- **`HOME_REGION`** 是缺省/引导区域：用于把经纬度反解为国家，也是任何国家没有匹配时的回落区域。路由开启时它必须是全球覆盖区域（不能是 GrabMaps 区 `ap-southeast-1` / `ap-southeast-5`），因为反解全球任意坐标需要全球覆盖。
-- **「国家→区域」映射**（`config/country-region-map.json`）是**在用区域的唯一事实源**：其顶层 key 即为区域集。每个 key 都会生成一条 CloudFront 行为、需要一个 API key，并在启动时被校验。
-- **`HOME_REGION` 必须作为映射的一个 key 出现。** 仅作回落（不绑定任何具体国家）的区域用空数组表示，例如 `"ap-northeast-1": []`。
-- 路由**关闭**时，所有请求都走 `HOME_REGION`——与普通单区域代理完全一致。
+- **「国家→区域」映射**（`config/country-region-map.json`）是**唯一事实源**：其顶层 key 即为区域集（每个 key 生成一条 CloudFront 行为、需要一个 API key、启动时校验），其中一个区域在国家列表里用 `"*"` 标记为 **home**。
+- **home 区域**是缺省/引导区域：用于把经纬度反解为国家，也是任何国家没有匹配时的回落区域。通过在该区域的国家列表里放 `"*"` 来指定（如 `"ap-northeast-1": ["*"]`，或 `["*", "JP"]` 表示它同时也服务具体国家）。必须且只能有一个区域被标记。**没有 `HOME_REGION` 环境变量**——由映射文件定义。
+- home 区域在路由开启时必须是全球覆盖区域（不能是 GrabMaps 区 `ap-southeast-1` / `ap-southeast-5`），因为反解全球任意坐标需要全球覆盖。
+- 路由**关闭**时，所有请求都走 home 区域——与普通单区域代理完全一致。
 
 ## 架构
 
@@ -63,26 +63,25 @@
 | **部署区域**（`<deploy-region>`） | 承载基础设施的**单一**区域：Secrets Manager secret、CloudFront 栈、ECS 栈、ECR 仓库都在这里。 |
 | **ALS 区域**（`<als-region>`） | 代理要路由到的区域——映射文件里的某个 key，**可以有多个**。 |
 
-`HOME_REGION` 与部署区域相互独立，可相同也可不同（例如：为降低延迟部署在新加坡，但由于新加坡是 GrabMaps 区、不能作反解引导，于是设 `HOME_REGION=ap-northeast-1`）。
+home 区域与部署区域相互独立，可相同也可不同（例如：为降低延迟部署在新加坡，但由于新加坡是 GrabMaps 区、不能作反解引导，于是把 `ap-northeast-1` 用 `"*"` 标记为 home）。
 
 ## 环境变量
 
 | 变量 | 说明 | 示例 |
 |---|---|---|
-| `HOME_REGION` | 缺省/引导 ALS 区域，必须是映射文件里的一个 key。路由开启时必须为全球覆盖区（非 `ap-southeast-1` / `ap-southeast-5`）。 | `ap-northeast-1` |
-| `MULTI_REGION_ROUTING` | 总开关，默认 `false`（单区域：一切走 `HOME_REGION`）。 | `true` |
+| `MULTI_REGION_ROUTING` | 总开关，默认 `false`（单区域：一切走 home 区域）。 | `true` |
 | `LOCATION_API_KEYS` | region→API Key 的 JSON（每 key 含 geo-places + geo-maps）。以一个 Secrets Manager secret 提供。 | `{"ap-northeast-1":"v1.public.xxx"}` |
 | `MAP_TILE_DOMAIN` | CloudFront 瓦片域名（CloudFront 栈的输出）。 | `d123.cloudfront.net` |
 
-> 在用区域**不是**环境变量——它们是 `config/country-region-map.json` 的 key。本地通过 `export` 设置这些变量；生产环境通过 CloudFormation 参数传入（见下文）。两种机制相互独立。
+> 在用区域**和 home 区域**都**不是**环境变量——它们来自 `config/country-region-map.json`（其 key,以及被 `"*"` 标记的区域）。本地通过 `export` 设置上面这些变量；生产环境通过 CloudFormation 参数传入（见下文）。两种机制相互独立。
 
 ## 国家→区域映射文件
 
-`config/country-region-map.json` 采用区域优先结构（`{ 区域: [ISO 国家代码] }`），是区域集的唯一事实源：
+`config/country-region-map.json` 采用区域优先结构（`{ 区域: [ISO 国家代码] }`），是区域集与 home 区域的唯一事实源：
 
 ```json
 {
-  "ap-northeast-1": [],
+  "ap-northeast-1": ["*", "JP", "KR"],
   "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH"],
   "eu-central-1": ["DE", "FR", "NL", "IE", "ES", "IT"],
   "us-east-1": ["US", "CA", "MX"]
@@ -90,8 +89,8 @@
 ```
 
 - 每个顶层 key 都是一个在用区域（生成 CloudFront 行为、需要 key、启动时校验）。
-- `[]` 表示「该区域不绑定具体国家」——用于仅作回落的 `HOME_REGION`。
-- 未列出的国家在请求时回落到 `HOME_REGION`（会记日志，不报错）。
+- 必须且只能有一个区域在国家列表里含 `"*"`——它标记 **home 区域**（回落 + 反解引导）。该区域也可同时服务具体国家（如上），或仅作回落（`"ap-northeast-1": ["*"]`）。
+- 未列出的国家在请求时回落到 home 区域（会记日志，不报错）。
 
 **真实的** `config/country-region-map.json` 已加入 `.gitignore`（国家清单因部署而异），仓库只跟踪 `config/country-region-map-example.json`。请从示例创建你的真实文件：
 
@@ -99,8 +98,8 @@
 cp config/country-region-map-example.json config/country-region-map.json
 ```
 
-- **多区域**：按业务修改副本（区域 + 国家），并保持 `HOME_REGION` 是其中一个 key。
-- **单区域**：只保留一个区域，例如 `{ "us-east-1": [] }`（所有国家都回落到它）。
+- **多区域**：按业务修改副本（区域 + 国家），并保持恰好一个区域用 `"*"` 标记为 home。
+- **单区域**：只保留一个区域并标记为 home，例如 `{ "us-east-1": ["*"] }`（所有国家都回落到它）。
 
 该文件是运行时必需的：应用启动时读取它，缺失会直接启动失败（错误信息会提示执行上面的 `cp`）。`docker build` 也会把它打包进镜像，因此构建前同样需先准备好。
 
@@ -115,8 +114,8 @@ cp config/country-region-map-example.json config/country-region-map.json
 # 然后按你的区域/国家编辑 config/country-region-map.json
 ```
 
-- **单区域**：精简为一个区域，例如 `{ "us-east-1": [] }`。
-- **多区域**：列出每个区域及其国家；保持 `HOME_REGION` 是其中一个 key。
+- **单区域**：精简为一个区域并标记为 home，例如 `{ "us-east-1": ["*"] }`。
+- **多区域**：列出每个区域及其国家；恰好一个区域用 `"*"` 标记为 home。
 
 ### 1. 创建各区域 API Key 并存入 Secrets Manager
 
@@ -191,9 +190,8 @@ aws cloudformation describe-stacks \
 
 ```bash
 npm install
-# （映射文件已在步骤 0 创建）
+# （映射文件已在步骤 0 创建；被 "*" 标记的区域即为 home 区域）
 
-export HOME_REGION=ap-northeast-1
 export MULTI_REGION_ROUTING=true   # 单区域：false
 export LOCATION_API_KEYS='{"ap-northeast-1":"v1.public.xxx","eu-central-1":"v1.public.yyy"}'
 export MAP_TILE_DOMAIN=d1234567890.cloudfront.net   # 步骤 2 获取
@@ -233,7 +231,7 @@ docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.
 docker push <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 ```
 
-**b. 部署 ECS Fargate 栈**（在部署区域）。区域集来自镜像里打包的映射文件，因此只需传 `HomeRegion` / `MultiRegionRouting` / secret / 域名 / 镜像：
+**b. 部署 ECS Fargate 栈**（在部署区域）。区域集与 home 区域都来自镜像里打包的映射文件，因此只需传 `MultiRegionRouting` / secret / 域名 / 镜像：
 
 ```bash
 aws cloudformation deploy \
@@ -242,14 +240,13 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     LocationApiKeysSecretArn=arn:aws:secretsmanager:<deploy-region>:<ACCOUNT_ID>:secret:location-proxy/api-keys-XXXXXX \
-    HomeRegion=ap-northeast-1 \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
     ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
   --region <deploy-region>
 ```
 
-- **单区域**：设 `MultiRegionRouting=false`，`HomeRegion` 设为你的唯一区域。
+- **单区域**：设 `MultiRegionRouting=false`（home 区域即你在映射里用 `"*"` 标记的那个）。
 
 **c. 获取访问地址**：
 

@@ -5,8 +5,8 @@
 # LOCATION_API_KEYS JSON ({ region: key }).
 #
 # The set of regions is the single source of truth in the mapping file
-# (its top-level keys). HOME_REGION must be one of them; it is included
-# automatically since the convention requires it to appear in the mapping.
+# (its top-level keys). The home region is the "*"-marked key and is therefore
+# always included; "*" lives in the value arrays and is never a region name.
 #
 # Usage:
 #   scripts/create-api-keys.sh [--write-secret] [options]

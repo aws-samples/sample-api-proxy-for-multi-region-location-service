@@ -22,6 +22,27 @@ test("edge function strips the region path prefix before forwarding", () => {
   assert.match(tpl, /request\.uri = request\.uri\.slice\('\/eu-west-1'\.length\);/);
 });
 
+test("DefaultCacheBehavior points at the home region, not regions[0]", () => {
+  // regions[0] is eu-west-1, but home is us-east-1 → default must use home.
+  const tpl = buildTemplate(["eu-west-1", "us-east-1"], "s", "", "us-east-1");
+  const defaultBlock = tpl.slice(
+    tpl.indexOf("DefaultCacheBehavior:"),
+    tpl.indexOf("CacheBehaviors:")
+  );
+  assert.match(defaultBlock, /TargetOriginId: UsEast1Origin/);
+  assert.match(defaultBlock, /UsEast1AppendKeyFunction/);
+  assert.doesNotMatch(defaultBlock, /EuWest1Origin/);
+});
+
+test("home region defaults to regions[0] when not specified", () => {
+  const tpl = buildTemplate(["eu-west-1", "us-east-1"], "s");
+  const defaultBlock = tpl.slice(
+    tpl.indexOf("DefaultCacheBehavior:"),
+    tpl.indexOf("CacheBehaviors:")
+  );
+  assert.match(defaultBlock, /TargetOriginId: EuWest1Origin/);
+});
+
 test("policy suffix makes account-global policy names unique", () => {
   const tpl = buildTemplate(["eu-west-1"], "s", "ab12cd");
   assert.match(tpl, /Name: !Sub "\$\{AWS::StackName\}-MapTileCache-ab12cd"/);
