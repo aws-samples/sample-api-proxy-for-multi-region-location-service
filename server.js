@@ -9,12 +9,9 @@ const { regionCenter } = require("./config/region-centers");
 
 const PORT = 3000;
 const MAPPING_FILE = path.join(__dirname, "config", "country-region-map.json");
-const ALL_STYLES = [
-  { id: "Standard", label: "标准" },
-  { id: "Monochrome", label: "单色" },
-  { id: "Hybrid", label: "混合" },
-  { id: "Satellite", label: "卫星" },
-];
+// Candidate ALS style ids probed at startup. Display names are a UI concern
+// and belong to the frontend, so the backend deals only in style ids.
+const ALL_STYLES = ["Standard", "Monochrome", "Hybrid", "Satellite"];
 
 // Build the express app from injected dependencies (testable).
 function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles }) {
@@ -100,9 +97,33 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
           ? regionParam
           : await targetRegionFor({ countryCode, lat, lng });
       const data = await als.getPlace({ region, key: keyFor(region), placeId: req.params.placeId, lang });
-      res.json({ label: data.Title, position: data.Position, address: data.Address });
+      // tileRegion = the region whose map data covers the RESULT's country
+      // (not necessarily the region that produced the PlaceId). The frontend
+      // switches map tiles to it so a result shows its local map data.
+      const country = data.Address?.Country?.Code2 || null;
+      const tileRegion = (country && mappingStore.getRegion(country)) || config.homeRegion;
+      res.json({ label: data.Title, position: data.Position, address: data.Address, tileRegion, country });
     } catch (err) {
       console.error("GetPlace error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Map a coordinate to the region whose map data covers its country. Used for
+  // HERE suggestions that carry a position (no GetPlace call) so the frontend
+  // can still switch tiles to the result's local region.
+  app.get("/api/tile-region", async (req, res) => {
+    const { lat, lng } = req.query;
+    try {
+      let tileRegion = config.homeRegion;
+      let country = null;
+      if (lat != null && lng != null) {
+        country = await reverseGeocoder.toCountry(parseFloat(lat), parseFloat(lng));
+        if (country) tileRegion = mappingStore.getRegion(country) || config.homeRegion;
+      }
+      res.json({ tileRegion, country });
+    } catch (err) {
+      console.error("tile-region error:", err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -110,9 +131,8 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   app.get("/api/map-style", async (req, res) => {
     const styleName = req.query.style || "Standard";
     const { countryCode, lat, lng, region: regionParam } = req.query;
-    const allowed = availableStyles.map((s) => s.id);
-    if (!allowed.includes(styleName)) {
-      return res.status(400).json({ error: `Invalid style. Allowed: ${allowed.join(", ")}` });
+    if (!availableStyles.includes(styleName)) {
+      return res.status(400).json({ error: `Invalid style. Allowed: ${availableStyles.join(", ")}` });
     }
     try {
       // Explicit ?region lets the frontend switch map tiles to a selected
@@ -147,9 +167,9 @@ async function detectStyles(als, config) {
   const region = config.homeRegion;
   const key = config.keyMap.get(region);
   const results = await Promise.all(
-    ALL_STYLES.map(async (s) => {
+    ALL_STYLES.map(async (styleName) => {
       try {
-        return (await als.styleExists({ region, key, styleName: s.id })) ? s : null;
+        return (await als.styleExists({ region, key, styleName })) ? styleName : null;
       } catch {
         return null;
       }
@@ -182,7 +202,7 @@ async function main() {
     console.log(`   MULTI_REGION_ROUTING: ${config.routingEnabled}`);
     console.log(`   Regions (from mapping): ${[...config.enabledRegions].join(", ")}`);
     console.log(`   Mapping entries: ${mappingStore.size}`);
-    console.log(`   Available styles: ${availableStyles.map((s) => s.id).join(", ")}`);
+    console.log(`   Available styles: ${availableStyles.join(", ")}`);
   });
 }
 

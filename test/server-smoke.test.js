@@ -20,7 +20,7 @@ function fakeDeps() {
       rewriteStyle: (s) => s,
     },
     reverseGeocoder: { toCountry: async () => "JP" },
-    availableStyles: [{ id: "Standard", label: "标准" }],
+    availableStyles: ["Standard"],
   };
 }
 
@@ -126,6 +126,49 @@ test("place uses the explicit ?region param (region-scoped PlaceId)", async () =
   server.close();
   assert.strictEqual(seen.region, "eu-west-1");
   assert.strictEqual(seen.placeId, "PID");
+});
+
+test("place returns tileRegion = the result country's mapped region", async () => {
+  const deps = fakeDeps(); // mapping: DE → eu-west-1, else null; home ap-northeast-1
+  deps.als.getPlace = async () => ({
+    Title: "Berlin", Position: [13.4, 52.5], Address: { Country: { Code2: "DE" } },
+  });
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/place/PID?region=eu-west-1`);
+  const body = await res.json();
+  server.close();
+  assert.strictEqual(body.tileRegion, "eu-west-1"); // DE → eu-west-1
+});
+
+test("place tileRegion falls back to home when country is unmapped", async () => {
+  const deps = fakeDeps();
+  deps.als.getPlace = async () => ({
+    Title: "x", Position: [0, 0], Address: { Country: { Code2: "ZZ" } }, // unmapped
+  });
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/place/PID?region=eu-west-1`);
+  const body = await res.json();
+  server.close();
+  assert.strictEqual(body.tileRegion, "ap-northeast-1"); // home fallback
+});
+
+test("tile-region resolves a coordinate to its country's region", async () => {
+  const deps = fakeDeps();
+  // reverseGeocoder.toCountry returns JP in fakeDeps; map JP → home here
+  deps.mappingStore.getRegion = (cc) => (cc === "JP" ? "ap-northeast-1" : cc === "SG" ? "ap-southeast-1" : null);
+  deps.reverseGeocoder.toCountry = async () => "SG";
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/tile-region?lat=1.35&lng=103.8`);
+  const body = await res.json();
+  server.close();
+  assert.strictEqual(body.tileRegion, "ap-southeast-1");
+  assert.strictEqual(body.country, "SG"); // for context backfill
 });
 
 test("place ignores an out-of-set ?region and falls back to resolution", async () => {

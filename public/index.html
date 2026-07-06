@@ -24,6 +24,11 @@
     }
     #country-input { width: 110px; flex: 0 0 auto; text-transform: uppercase; }
     #search-input { flex: 1 1 auto; }
+    .follow-toggle {
+      display: block; margin-top: 6px; padding: 6px 10px;
+      background: #fff; border-radius: 8px; font-size: 12px; color: #555;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15); cursor: pointer;
+    }
     .suggestions {
       margin-top: 4px; background: #fff; border-radius: 8px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15);
@@ -80,6 +85,9 @@
       <input id="search-input" type="text" placeholder="🔍 搜索地址..." autocomplete="off" />
     </div>
     <div id="suggestions" class="suggestions"></div>
+    <label class="follow-toggle" title="选中某国结果后，自动把该国代码填入国家框，后续搜索沿用该国上下文。关闭则每次都从 HOME 全球搜索。">
+      <input type="checkbox" id="context-follow" checked /> 跟随所选结果的国家上下文
+    </label>
   </div>
 
   <div id="info-panel" class="info-panel">
@@ -94,6 +102,8 @@
 
   <script>
     let map, marker;
+    // Frontend-owned display names for style ids (the backend returns only ids).
+    const STYLE_LABELS = { Standard: "标准", Monochrome: "单色", Hybrid: "混合", Satellite: "卫星" };
     // The region whose tiles are currently shown. Starts at the home region
     // (map-config), and switches when a search result in another region is
     // selected. Kept explicit so we never infer routing from the map center.
@@ -131,15 +141,16 @@
       const mapConfig = await cfgRes.json();
       activeRegion = mapConfig.region; // home region initially drives the tiles
 
-      // Load available map styles and render switcher buttons
+      // Load available map style ids and render switcher buttons. Display names
+      // are a UI concern owned by the frontend (the backend returns only ids).
       const stylesRes = await fetch("/api/map-styles");
-      const styles = await stylesRes.json();
+      const styleIds = await stylesRes.json();
       const switcher = document.getElementById("style-switcher");
-      styles.forEach((s, i) => {
+      styleIds.forEach((id, i) => {
         const btn = document.createElement("button");
         btn.className = "style-btn" + (i === 0 ? " active" : "");
-        btn.dataset.style = s.id;
-        btn.textContent = s.label;
+        btn.dataset.style = id;
+        btn.textContent = STYLE_LABELS[id] || id;
         switcher.appendChild(btn);
       });
 
@@ -167,14 +178,16 @@
       });
     }
 
-    function setMarker(lng, lat, title, zoom) {
+    function setMarker(lng, lat, title, zoom, noFly) {
       if (marker) marker.remove();
       marker = new maplibregl.Marker({ color: "#FF4444" })
         .setLngLat([lng, lat])
         .setPopup(new maplibregl.Popup().setText(title || ""))
         .addTo(map);
       marker.togglePopup();
-      map.flyTo({ center: [lng, lat], zoom: zoom || 12 });
+      // When a tile-region switch is in progress, the styledata callback sets
+      // the final view — flying here too would fight it. noFly skips the fly.
+      if (!noFly) map.flyTo({ center: [lng, lat], zoom: zoom || 12 });
     }
 
     function showInfo(title, address, lng, lat) {
@@ -236,53 +249,81 @@
       }
     }
 
-    // Switch the map tiles to a region (e.g. a selected result's region), while
-    // preserving the current view and style. Skips if already on that region.
-    function switchTileRegion(region) {
-      if (!region || region === activeRegion) return;
+    // Switch the map tiles to a region (e.g. a selected result's region).
+    // Returns true if a switch was started, false if already on that region.
+    // `view` (optional {center:[lng,lat], zoom}) is the view to apply AFTER the
+    // new style loads — pass the result location so setStyle doesn't clobber it.
+    function switchTileRegion(region, view) {
+      if (!region || region === activeRegion) return false;
       activeRegion = region;
-      const center = map.getCenter();
-      const zoom = map.getZoom();
+      const target = view || { center: map.getCenter().toArray(), zoom: map.getZoom() };
       map.setStyle(`/api/map-style?style=${currentStyle}&region=${encodeURIComponent(region)}`);
       map.once("styledata", () => {
-        map.setCenter(center);
-        map.setZoom(zoom);
+        map.setCenter(target.center);
+        map.setZoom(target.zoom);
         map.resize();
         map.triggerRepaint();
       });
+      return true;
+    }
+
+    // Show a result: mark it, show info, and switch tiles to the region whose
+    // map data covers it. If we switch tiles, the target view is applied after
+    // the new style loads (so the style reload doesn't clobber the location);
+    // otherwise we fly there directly.
+    function showResult({ lng, lat, title, infoAddr, tileRegion, country }) {
+      const view = { center: [lng, lat], zoom: 15 };
+      showInfo(title, infoAddr, lng, lat);
+      const switching = switchTileRegion(tileRegion, view);
+      if (switching) {
+        setMarker(lng, lat, title, view.zoom, /*noFly*/ true);
+        map.jumpTo(view); // final view is set by switchTileRegion's styledata cb
+      } else {
+        setMarker(lng, lat, title, view.zoom);
+      }
+      // Context follow (demo behavior): backfill the country box with the
+      // result's country so subsequent searches stay in that country. The box
+      // is the single visible source of context — clear it to search globally.
+      const follow = document.getElementById("context-follow").checked;
+      if (follow && country) {
+        document.getElementById("country-input").value = country;
+      }
     }
 
     async function selectSuggestion(item) {
       sugBox.classList.remove("active");
       input.value = item.text;
-
-      // If we already have position from suggestion (HERE regions include it)
-      if (item.position) {
-        const [lng, lat] = item.position;
-        setMarker(lng, lat, item.text);
-        const addr = item.address;
-        showInfo(item.text, addr ? [addr.Street, addr.District, addr.Municipality].filter(Boolean).join(" ") : "", lng, lat);
-        switchTileRegion(item.region); // show the result region's local map data
-        return;
-      }
-
-      // Otherwise fetch place details. A PlaceId is region-scoped, so pass the
-      // region that produced this suggestion (GrabMaps suggestions omit
-      // position and must be resolved in their own region).
-      if (!item.placeId) return;
       try {
+        // HERE suggestions carry a position (no GetPlace needed); resolve the
+        // result's tile region from its coordinate.
+        if (item.position) {
+          const [lng, lat] = item.position;
+          const addr = item.address;
+          const tr = await fetch(`/api/tile-region?lat=${lat}&lng=${lng}`).then((r) => r.json());
+          showResult({
+            lng, lat, title: item.text,
+            infoAddr: addr ? [addr.Street, addr.District, addr.Municipality].filter(Boolean).join(" ") : "",
+            tileRegion: tr.tileRegion, country: tr.country,
+          });
+          return;
+        }
+
+        // GrabMaps suggestions omit position → GetPlace (region-scoped: pass the
+        // region that produced the PlaceId). The response's tileRegion tells us
+        // which region's tiles cover the result.
+        if (!item.placeId) return;
         const regionParam = item.region ? `?region=${encodeURIComponent(item.region)}` : "";
-        const res = await fetch(`/api/place/${item.placeId}${regionParam}`);
-        const place = await res.json();
+        const place = await fetch(`/api/place/${item.placeId}${regionParam}`).then((r) => r.json());
         if (place.position) {
           const [lng, lat] = place.position;
-          setMarker(lng, lat, place.label);
-          const addr = place.address;
-          showInfo(place.label, addr ? addr.Label : "", lng, lat);
-          switchTileRegion(item.region); // switch tiles to the result's region
+          showResult({
+            lng, lat, title: place.label,
+            infoAddr: place.address ? place.address.Label : "",
+            tileRegion: place.tileRegion, country: place.country,
+          });
         }
       } catch (err) {
-        console.error("GetPlace failed:", err);
+        console.error("Select failed:", err);
       }
     }
 
