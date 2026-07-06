@@ -15,12 +15,15 @@
       position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
       width: 420px; z-index: 10;
     }
-    .search-box input {
-      width: 100%; padding: 12px 16px; font-size: 15px;
+    .search-row { display: flex; gap: 6px; }
+    .search-row input {
+      padding: 12px 16px; font-size: 15px;
       border: none; border-radius: 8px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15);
       outline: none;
     }
+    #country-input { width: 110px; flex: 0 0 auto; text-transform: uppercase; }
+    #search-input { flex: 1 1 auto; }
     .suggestions {
       margin-top: 4px; background: #fff; border-radius: 8px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15);
@@ -71,7 +74,11 @@
   <div id="map"></div>
 
   <div class="search-box">
-    <input id="search-input" type="text" placeholder="🔍 搜索地址..." autocomplete="off" />
+    <div class="search-row">
+      <input id="country-input" type="text" placeholder="国家(如 SG)" maxlength="3" autocomplete="off"
+        title="可选：ISO 国家代码。填了则按该国精确过滤(演示业务系统传 countryCode)。" />
+      <input id="search-input" type="text" placeholder="🔍 搜索地址..." autocomplete="off" />
+    </div>
     <div id="suggestions" class="suggestions"></div>
   </div>
 
@@ -87,8 +94,43 @@
 
   <script>
     let map, marker;
+    // The region whose tiles are currently shown. Starts at the home region
+    // (map-config), and switches when a search result in another region is
+    // selected. Kept explicit so we never infer routing from the map center.
+    let activeRegion = null;
+    let currentStyle = "Standard";
+    // User's real location (from the locate button), used as the search bias.
+    // NOT the map center — the map center only reflects "what I last looked at".
+    let userLocation = null;
+
+    // Optional country code: from the demo dropdown, or a host page setting
+    // window.COUNTRY_CODE. Empty string when not set.
+    function countryCode() {
+      const fromInput = (document.getElementById("country-input").value || "").trim().toUpperCase();
+      return fromInput || window.COUNTRY_CODE || "";
+    }
+
+    // Build the shared routing query params per the API contract:
+    // countryCode (highest priority) OR user location lat/lng; else nothing (HOME).
+    function routingParams() {
+      const p = new URLSearchParams();
+      const cc = countryCode();
+      if (cc) {
+        p.set("countryCode", cc);
+      } else if (userLocation) {
+        p.set("lat", userLocation.lat);
+        p.set("lng", userLocation.lng);
+      }
+      return p;
+    }
 
     async function init() {
+      // Initial map view comes from the backend (home region's center), so the
+      // map opens inside the region's coverage instead of a hardcoded default.
+      const cfgRes = await fetch("/api/map-config");
+      const mapConfig = await cfgRes.json();
+      activeRegion = mapConfig.region; // home region initially drives the tiles
+
       // Load available map styles and render switcher buttons
       const stylesRes = await fetch("/api/map-styles");
       const styles = await stylesRes.json();
@@ -113,8 +155,8 @@
         // Style is proxied through Express: descriptor fetched server-side,
         // tile URLs rewritten to CloudFront, API key never exposed to browser
         style: "/api/map-style",
-        center: [116.4, 39.9], // Beijing
-        zoom: 12,
+        center: mapConfig.center, // home region center (from /api/map-config)
+        zoom: mapConfig.zoom,
       });
       map.addControl(new maplibregl.NavigationControl(), "top-right");
 
@@ -163,56 +205,88 @@
     });
 
     async function fetchSuggestions(query) {
+      // Routing signals per the contract: countryCode / user location / neither.
+      // The map center is deliberately NOT used.
+      const params = routingParams();
+      params.set("query", query);
+      try {
+        const res = await fetch(`/api/suggest?${params}`);
+        const items = await res.json();
+        // Guard against a non-array (e.g. an error object) so a bad response
+        // can never throw here and freeze the input handler.
+        if (!Array.isArray(items)) throw new Error(items && items.error ? items.error : "bad response");
+
+        sugBox.innerHTML = "";
+        items.forEach((item) => {
+          const div = document.createElement("div");
+          div.className = "suggestion-item";
+
+          const addr = item.address;
+          const subText = addr ? [addr.District, addr.Municipality, addr.Region, addr.Country?.Name].filter(Boolean).join(", ") : "";
+
+          div.innerHTML = `<div class="main">${item.text}</div><div class="sub">${subText}</div>`;
+          div.addEventListener("click", () => selectSuggestion(item));
+          sugBox.appendChild(div);
+        });
+        sugBox.classList.toggle("active", items.length > 0);
+      } catch (err) {
+        console.error("Suggest failed:", err);
+        sugBox.innerHTML = "";
+        sugBox.classList.remove("active");
+      }
+    }
+
+    // Switch the map tiles to a region (e.g. a selected result's region), while
+    // preserving the current view and style. Skips if already on that region.
+    function switchTileRegion(region) {
+      if (!region || region === activeRegion) return;
+      activeRegion = region;
       const center = map.getCenter();
-      const cc = window.COUNTRY_CODE || ""; // optionally set by host business page
-      const ccParam = cc ? `&countryCode=${encodeURIComponent(cc)}` : "";
-      const res = await fetch(
-        `/api/suggest?query=${encodeURIComponent(query)}&lat=${center.lat}&lng=${center.lng}${ccParam}`
-      );
-      const items = await res.json();
-
-      sugBox.innerHTML = "";
-      items.forEach((item) => {
-        const div = document.createElement("div");
-        div.className = "suggestion-item";
-
-        const addr = item.address;
-        const subText = addr ? [addr.District, addr.Municipality, addr.Region, addr.Country?.Name].filter(Boolean).join(", ") : "";
-
-        div.innerHTML = `<div class="main">${item.text}</div><div class="sub">${subText}</div>`;
-        div.addEventListener("click", () => selectSuggestion(item));
-        sugBox.appendChild(div);
+      const zoom = map.getZoom();
+      map.setStyle(`/api/map-style?style=${currentStyle}&region=${encodeURIComponent(region)}`);
+      map.once("styledata", () => {
+        map.setCenter(center);
+        map.setZoom(zoom);
+        map.resize();
+        map.triggerRepaint();
       });
-      sugBox.classList.toggle("active", items.length > 0);
     }
 
     async function selectSuggestion(item) {
       sugBox.classList.remove("active");
       input.value = item.text;
 
-      // If we already have position from suggestion
+      // If we already have position from suggestion (HERE regions include it)
       if (item.position) {
         const [lng, lat] = item.position;
         setMarker(lng, lat, item.text);
         const addr = item.address;
         showInfo(item.text, addr ? [addr.Street, addr.District, addr.Municipality].filter(Boolean).join(" ") : "", lng, lat);
+        switchTileRegion(item.region); // show the result region's local map data
         return;
       }
 
-      // Otherwise fetch place details
+      // Otherwise fetch place details. A PlaceId is region-scoped, so pass the
+      // region that produced this suggestion (GrabMaps suggestions omit
+      // position and must be resolved in their own region).
       if (!item.placeId) return;
-      const res = await fetch(`/api/place/${item.placeId}`);
-      const place = await res.json();
-      if (place.position) {
-        const [lng, lat] = place.position;
-        setMarker(lng, lat, place.label);
-        const addr = place.address;
-        showInfo(place.label, addr ? addr.Label : "", lng, lat);
+      try {
+        const regionParam = item.region ? `?region=${encodeURIComponent(item.region)}` : "";
+        const res = await fetch(`/api/place/${item.placeId}${regionParam}`);
+        const place = await res.json();
+        if (place.position) {
+          const [lng, lat] = place.position;
+          setMarker(lng, lat, place.label);
+          const addr = place.address;
+          showInfo(place.label, addr ? addr.Label : "", lng, lat);
+          switchTileRegion(item.region); // switch tiles to the result's region
+        }
+      } catch (err) {
+        console.error("GetPlace failed:", err);
       }
     }
 
-    // Style switcher
-    let currentStyle = "Standard";
+    // Style switcher — changes style but keeps the current tile region.
     document.getElementById("style-switcher").addEventListener("click", async (e) => {
       const btn = e.target.closest(".style-btn");
       if (!btn) return;
@@ -225,9 +299,8 @@
 
       const center = map.getCenter();
       const zoom = map.getZoom();
-      const cc = window.COUNTRY_CODE || "";
-      const ccParam = cc ? `&countryCode=${encodeURIComponent(cc)}` : "";
-      map.setStyle(`/api/map-style?style=${styleName}${ccParam}`);
+      const regionParam = activeRegion ? `&region=${encodeURIComponent(activeRegion)}` : "";
+      map.setStyle(`/api/map-style?style=${styleName}${regionParam}`);
       map.once("styledata", () => {
         map.setCenter(center);
         map.setZoom(zoom);
@@ -236,12 +309,14 @@
       });
     });
 
-    // Geolocation
+    // Geolocation — records the user's REAL location as the search bias
+    // (distinct from the map center) and centers the map on it.
     document.getElementById("locate-btn").addEventListener("click", () => {
       if (!navigator.geolocation) return alert("浏览器不支持定位");
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           const { longitude: lng, latitude: lat } = pos.coords;
+          userLocation = { lat, lng };
           setMarker(lng, lat, "我的位置");
           showInfo("我的位置", "当前设备定位", lng, lat);
         },

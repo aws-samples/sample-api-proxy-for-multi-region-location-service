@@ -12,10 +12,17 @@ function cleanProps(obj) {
 }
 
 function createAlsClient({ fetchImpl = fetch } = {}) {
-  async function suggest({ region, key, query, lat, lng }) {
+  // lang controls the result display language only (not input); defaults to en
+  // (this proxy targets overseas regions). includeCountries (ISO codes) becomes
+  // a hard Filter.IncludeCountries — it coexists with BiasPosition and overrides
+  // bias ranking, so results are constrained to those countries.
+  async function suggest({ region, key, query, lat, lng, includeCountries, lang }) {
     const params = new URLSearchParams({ key });
-    const body = { QueryText: query, Language: "zh", MaxResults: 5 };
+    const body = { QueryText: query, Language: lang || "en", MaxResults: 5 };
     if (lat != null && lng != null) body.BiasPosition = [parseFloat(lng), parseFloat(lat)];
+    if (includeCountries && includeCountries.length) {
+      body.Filter = { IncludeCountries: includeCountries };
+    }
     const resp = await fetchImpl(`${placesEndpoint(region)}/v2/suggest?${params}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -24,8 +31,8 @@ function createAlsClient({ fetchImpl = fetch } = {}) {
     return resp.json();
   }
 
-  async function getPlace({ region, key, placeId }) {
-    const params = new URLSearchParams({ key, language: "zh" });
+  async function getPlace({ region, key, placeId, lang }) {
+    const params = new URLSearchParams({ key, language: lang || "en" });
     const resp = await fetchImpl(`${placesEndpoint(region)}/v2/place/${placeId}?${params}`);
     return resp.json();
   }

@@ -35,6 +35,33 @@ test("suggest hits the region's places endpoint", async () => {
   assert.match(captured.url, /places\.geo\.ap-northeast-1\.amazonaws\.com\/v2\/suggest/);
 });
 
+test("suggest sends bias, and defaults Language to en", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { ResultItems: [] }) });
+  await als.suggest({ region: "eu-west-1", key: "k", query: "paris", lat: 48.85, lng: 2.35 });
+  const body = JSON.parse(captured.opts.body);
+  assert.deepStrictEqual(body.BiasPosition, [2.35, 48.85]);
+  assert.strictEqual(body.Language, "en");
+  assert.strictEqual(body.Filter, undefined); // no IncludeCountries when none given
+});
+
+test("suggest with includeCountries sets Filter.IncludeCountries (hard filter)", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { ResultItems: [] }) });
+  await als.suggest({ region: "ap-southeast-1", key: "k", query: "airport", lat: 1.35, lng: 103.82, includeCountries: ["TH"] });
+  const body = JSON.parse(captured.opts.body);
+  assert.deepStrictEqual(body.Filter.IncludeCountries, ["TH"]);
+  // IncludeCountries and BiasPosition coexist (verified against ALS v2)
+  assert.deepStrictEqual(body.BiasPosition, [103.82, 1.35]);
+});
+
+test("suggest passes an explicit lang through as Language", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { ResultItems: [] }) });
+  await als.suggest({ region: "ap-southeast-1", key: "k", query: "x", lat: 1.35, lng: 103.82, lang: "th" });
+  assert.strictEqual(JSON.parse(captured.opts.body).Language, "th");
+});
+
 test("rewriteStyle replaces region origin with CloudFront region-prefixed path and strips key", () => {
   const als = createAlsClient({ fetchImpl: async () => ({}) });
   const style = {
@@ -50,11 +77,18 @@ test("rewriteStyle replaces region origin with CloudFront region-prefixed path a
   assert.deepStrictEqual(out.layers[0].paint, { y: 1 });
 });
 
-test("getPlace hits the region's place endpoint with placeId and language", async () => {
+test("getPlace hits the region's place endpoint with placeId and default language en", async () => {
   const captured = {};
   const als = createAlsClient({ fetchImpl: fakeFetch(captured, { Title: "x" }) });
   await als.getPlace({ region: "eu-west-1", key: "k2", placeId: "abc123" });
   assert.match(captured.url, /places\.geo\.eu-west-1\.amazonaws\.com\/v2\/place\/abc123/);
-  assert.match(captured.url, /language=zh/);
+  assert.match(captured.url, /language=en/);
   assert.match(captured.url, /key=k2/);
+});
+
+test("getPlace passes an explicit lang", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { Title: "x" }) });
+  await als.getPlace({ region: "eu-west-1", key: "k2", placeId: "abc", lang: "zh" });
+  assert.match(captured.url, /language=zh/);
 });
