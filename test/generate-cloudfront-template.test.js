@@ -22,6 +22,20 @@ test("edge function strips the region path prefix before forwarding", () => {
   assert.match(tpl, /request\.uri = request\.uri\.slice\('\/eu-west-1'\.length\);/);
 });
 
+test("functions are chained with DependsOn to serialize creation (avoid rate limit)", () => {
+  const tpl = buildTemplate(["ap-northeast-1", "eu-west-1", "us-east-1"], "s");
+  // first function has no DependsOn; each subsequent one depends on the prior.
+  assert.match(tpl, /EuWest1AppendKeyFunction:\n\s+Type: AWS::CloudFront::Function\n\s+DependsOn: ApNortheast1AppendKeyFunction/);
+  assert.match(tpl, /UsEast1AppendKeyFunction:\n\s+Type: AWS::CloudFront::Function\n\s+DependsOn: EuWest1AppendKeyFunction/);
+  // the first one must NOT carry a DependsOn
+  assert.doesNotMatch(tpl, /ApNortheast1AppendKeyFunction:\n\s+Type: AWS::CloudFront::Function\n\s+DependsOn/);
+});
+
+test("single region has no DependsOn", () => {
+  const tpl = buildTemplate(["eu-west-1"], "s");
+  assert.doesNotMatch(tpl, /DependsOn/);
+});
+
 test("DefaultCacheBehavior points at the home region, not regions[0]", () => {
   // regions[0] is eu-west-1, but home is us-east-1 → default must use home.
   const tpl = buildTemplate(["eu-west-1", "us-east-1"], "s", "", "us-east-1");

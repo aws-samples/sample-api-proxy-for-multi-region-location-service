@@ -9,10 +9,14 @@ function pascal(region) {
     .join("");
 }
 
-function functionResource(region, secretName) {
+// prevRegion (optional): the region whose function this one must be created
+// after. Chaining DependsOn serializes CloudFront Function creation so a
+// many-region stack doesn't hit the Function control-plane rate limit.
+function functionResource(region, secretName, prevRegion) {
   const name = pascal(region);
+  const dependsOn = prevRegion ? `\n    DependsOn: ${pascal(prevRegion)}AppendKeyFunction` : "";
   return `  ${name}AppendKeyFunction:
-    Type: AWS::CloudFront::Function
+    Type: AWS::CloudFront::Function${dependsOn}
     Properties:
       Name: !Sub "\${AWS::StackName}-${name}-AppendKey"
       AutoPublish: true
@@ -62,7 +66,9 @@ function behaviorResource(region) {
 // policySuffix makes them unique. It is passed in (not generated here) so this
 // function stays pure and testable; main() supplies a random one.
 function buildTemplate(regions, secretName, policySuffix = "", homeRegion = regions[0]) {
-  const functions = regions.map((r) => functionResource(r, secretName)).join("\n");
+  const functions = regions
+    .map((r, i) => functionResource(r, secretName, i > 0 ? regions[i - 1] : undefined))
+    .join("\n");
   const origins = regions.map(originResource).join("");
   const behaviors = regions.map(behaviorResource).join("");
   // The DefaultCacheBehavior handles URIs without a known /<region>/ prefix
