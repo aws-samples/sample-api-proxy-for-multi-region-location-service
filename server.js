@@ -38,6 +38,10 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
 
   app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+  // Browsers auto-request /favicon.ico; we don't ship one. Return 204 so it
+  // doesn't show up as a 404 in the console.
+  app.get("/favicon.ico", (req, res) => res.status(204).end());
+
   app.get("/api/suggest", async (req, res) => {
     const { query, lat, lng, countryCode, lang } = req.query;
     if (!query) return res.json([]);

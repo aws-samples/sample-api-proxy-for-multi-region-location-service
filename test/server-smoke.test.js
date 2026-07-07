@@ -29,6 +29,15 @@ test("buildApp returns an express app without throwing", () => {
   assert.strictEqual(typeof app.listen, "function");
 });
 
+test("favicon.ico returns 204 (no console 404 noise)", async () => {
+  const app = buildApp(fakeDeps());
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/favicon.ico`);
+  server.close();
+  assert.strictEqual(res.status, 204);
+});
+
 test("map-style returns 400 for a disallowed style", async () => {
   const app = buildApp(fakeDeps());
   const server = app.listen(0);

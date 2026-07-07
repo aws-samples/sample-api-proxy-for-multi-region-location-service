@@ -104,6 +104,17 @@
     let map, marker;
     // Frontend-owned display names for style ids (the backend returns only ids).
     const STYLE_LABELS = { Standard: "标准", Monochrome: "单色", Hybrid: "混合", Satellite: "卫星" };
+
+    // Fetch a proxied style descriptor and drop its "projection" field.
+    // Amazon Location returns projection:{type:"globe"}, but MapLibre 4.7.1
+    // doesn't render globe and rebuilds the whole style on every setStyle (the
+    // "Unimplemented: setProjection" warning + flicker). We strip it CLIENT-SIDE
+    // so the backend stays generic — a client on MapLibre 5 can still use globe.
+    async function loadStyle(url) {
+      const style = await fetch(url).then((r) => r.json());
+      delete style.projection;
+      return style;
+    }
     // The region whose tiles are currently shown. Starts at the home region
     // (map-config), and switches when a search result in another region is
     // selected. Kept explicit so we never infer routing from the map center.
@@ -164,8 +175,9 @@
       map = new maplibregl.Map({
         container: "map",
         // Style is proxied through Express: descriptor fetched server-side,
-        // tile URLs rewritten to CloudFront, API key never exposed to browser
-        style: "/api/map-style",
+        // tile URLs rewritten to CloudFront, API key never exposed to browser.
+        // Loaded as an object (via loadStyle) so projection is stripped.
+        style: await loadStyle("/api/map-style"),
         center: mapConfig.center, // home region center (from /api/map-config)
         zoom: mapConfig.zoom,
       });
@@ -257,12 +269,14 @@
       if (!region || region === activeRegion) return false;
       activeRegion = region;
       const target = view || { center: map.getCenter().toArray(), zoom: map.getZoom() };
-      map.setStyle(`/api/map-style?style=${currentStyle}&region=${encodeURIComponent(region)}`);
-      map.once("styledata", () => {
-        map.setCenter(target.center);
-        map.setZoom(target.zoom);
-        map.resize();
-        map.triggerRepaint();
+      loadStyle(`/api/map-style?style=${currentStyle}&region=${encodeURIComponent(region)}`).then((style) => {
+        map.setStyle(style);
+        map.once("styledata", () => {
+          map.setCenter(target.center);
+          map.setZoom(target.zoom);
+          map.resize();
+          map.triggerRepaint();
+        });
       });
       return true;
     }
@@ -341,7 +355,7 @@
       const center = map.getCenter();
       const zoom = map.getZoom();
       const regionParam = activeRegion ? `&region=${encodeURIComponent(activeRegion)}` : "";
-      map.setStyle(`/api/map-style?style=${styleName}${regionParam}`);
+      map.setStyle(await loadStyle(`/api/map-style?style=${styleName}${regionParam}`));
       map.once("styledata", () => {
         map.setCenter(center);
         map.setZoom(zoom);
