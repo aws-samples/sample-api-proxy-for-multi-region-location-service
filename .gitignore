@@ -1,6 +1,7 @@
 node_modules/
 .env
 config/country-region-map.json
+infra/cloudfront-map-proxy.yaml
 .kiro/
 .vscode/
 .claude/
