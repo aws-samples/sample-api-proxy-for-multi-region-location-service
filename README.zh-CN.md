@@ -248,6 +248,10 @@ aws cloudformation deploy \
 
 - **单区域**：设 `MultiRegionRouting=false`（home 区域即你在映射里用 `"*"` 标记的那个）。
 
+> **重新部署代码/映射改动**：如果重新 build 并推送到**同一个镜像 tag**（`:latest`），`cloudformation deploy` 会因为参数没变而提示 *"No changes to deploy. Stack xxx is up to date"* ——运行中的任务仍是旧镜像。两种真正生效的方式：
+> - 强制新部署（最简单）：`aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>`（`<cluster>`/`<service>` 取自 stack 的 `ClusterName` / `ServiceName` 输出）。
+> - 或推送**不可变 tag**（如 git SHA）并传 `ImageUri=...:<sha>` ——参数变了 CloudFormation 就会自动滚动更新（生产推荐，也便于回滚）。
+
 **c. 获取访问地址**：
 
 ```bash
@@ -260,7 +264,7 @@ aws cloudformation describe-stacks \
 
 ## 更新国家→区域映射
 
-编辑 `config/country-region-map.json`，然后重新部署（重建镜像 → 推送 → `cloudformation deploy`）。ECS 会执行零停机滚动更新。如果新增了**新区域**，需先创建其 key 并更新 secret（重跑步骤 1），并重新生成 + 部署 CloudFront 栈（步骤 2）。映射配错会导致启动校验失败，新任务无法通过健康检查，旧版本继续服务。
+编辑 `config/country-region-map.json`，然后重建并推送镜像。用 `aws ecs update-service --force-new-deployment` 触发滚动更新（或用不可变镜像 tag——见步骤 b 下的说明;tag 不变时单跑 `cloudformation deploy` 不会生效）。ECS 会执行零停机滚动更新。如果新增了**新区域**，需先创建其 key 并更新 secret（重跑步骤 1），并重新生成 + 部署 CloudFront 栈（步骤 2）。映射配错会导致启动校验失败，新任务无法通过健康检查，旧版本继续服务。
 
 ## 测试
 

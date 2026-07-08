@@ -248,6 +248,10 @@ aws cloudformation deploy \
 
 - **Single-region**: set `MultiRegionRouting=false` (the home region is whatever you marked `"*"` in the mapping).
 
+> **Redeploying code/mapping changes**: if you rebuild and push to the **same image tag** (`:latest`), `cloudformation deploy` sees no parameter change and reports *"No changes to deploy. Stack xxx is up to date"* — the running tasks keep the old image. Two ways to actually roll out:
+> - Force a new deployment (simplest): `aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>` (get `<cluster>`/`<service>` from the stack's `ClusterName` / `ServiceName` outputs).
+> - Or push an **immutable tag** (e.g. a git SHA) and pass it as `ImageUri=...:<sha>` — the changed parameter makes CloudFormation roll out automatically (recommended for production; also gives clean rollbacks).
+
 **c. Get the access URL**:
 
 ```bash
@@ -260,7 +264,7 @@ aws cloudformation describe-stacks \
 
 ## Updating the country→region mapping
 
-Edit `config/country-region-map.json`, then redeploy (rebuild image → push → `cloudformation deploy`). ECS performs a zero-downtime rolling update. If you added a **new region**, first create its key and update the secret (rerun step 1) and regenerate + redeploy the CloudFront stack (step 2). A misconfigured mapping fails the startup validation, so the new task never becomes healthy and the old version keeps serving.
+Edit `config/country-region-map.json`, then rebuild and push the image. Roll it out with `aws ecs update-service --force-new-deployment` (or an immutable image tag — see the note under step b; `cloudformation deploy` alone does nothing when the tag is unchanged). ECS performs a zero-downtime rolling update. If you added a **new region**, first create its key and update the secret (rerun step 1) and regenerate + redeploy the CloudFront stack (step 2). A misconfigured mapping fails the startup validation, so the new task never becomes healthy and the old version keeps serving.
 
 ## Tests
 
