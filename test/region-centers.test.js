@@ -1,6 +1,17 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { regionCenter, REGION_CENTERS } = require("../config/region-centers");
+const { ALS_SUPPORTED_REGIONS } = require("../config/als-regions");
+
+test("every ALS-supported region has a real center (never falls back to [0,0])", () => {
+  // region-centers drives BOTH the initial map view and the search bias. A
+  // missing entry → [0,0] bias, which returns zero results in coverage-limited
+  // regions (the GrabMaps failure, but latent for any uncovered region). So the
+  // center table MUST cover the entire ALS-supported set.
+  for (const r of ALS_SUPPORTED_REGIONS) {
+    assert.ok(REGION_CENTERS[r], `${r} is ALS-supported but has no REGION_CENTERS entry`);
+  }
+});
 
 test("returns center [lng, lat] and zoom for a known region", () => {
   const c = regionCenter("ap-southeast-1");

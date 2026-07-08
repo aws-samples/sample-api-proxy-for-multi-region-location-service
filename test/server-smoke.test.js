@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { buildApp } = require("../server");
+const { buildApp, detectStyles } = require("../server");
 
 function fakeDeps() {
   return {
@@ -243,4 +243,150 @@ test("map-style accepts an explicit ?region param", async () => {
   await fetch(`http://127.0.0.1:${port}/api/map-style?style=Standard&region=eu-west-1`);
   server.close();
   assert.strictEqual(seen.region, "eu-west-1");
+});
+
+// --- detectStyles: a transient ALS blip at boot must not leave a "healthy"
+// task that serves zero styles (empty switcher + 400 on every map-style). ---
+
+const detectConfig = { homeRegion: "ap-northeast-1", keyMap: new Map([["ap-northeast-1", "k1"]]) };
+
+test("detectStyles returns the styles that exist", async () => {
+  const als = { styleExists: async ({ styleName }) => styleName === "Standard" || styleName === "Hybrid" };
+  const styles = await detectStyles(als, detectConfig);
+  assert.deepStrictEqual(styles.sort(), ["Hybrid", "Standard"]);
+});
+
+test("detectStyles tolerates a single style's probe throwing", async () => {
+  const als = {
+    styleExists: async ({ styleName }) => {
+      if (styleName === "Monochrome") throw new Error("flaky");
+      return true; // the other three exist
+    },
+  };
+  const styles = await detectStyles(als, detectConfig);
+  assert.ok(styles.includes("Standard"));
+  assert.ok(!styles.includes("Monochrome"));
+  assert.strictEqual(styles.length, 3);
+});
+
+test("detectStyles throws when NO style resolves (fail fast so ECS replaces the task)", async () => {
+  // e.g. ALS briefly unreachable at boot → every probe fails. Returning [] would
+  // leave a task that passes /health but can never render a map.
+  const als = { styleExists: async () => { throw new Error("ALS unreachable"); } };
+  await assert.rejects(() => detectStyles(als, detectConfig), /no map styles/i);
+});
+
+// --- CORS + rate limiting are wired onto /api only (not /health). ---
+
+test("/health is exempt from rate limiting (ALB health check must never be throttled)", async () => {
+  const deps = fakeDeps();
+  deps.config.rateLimit = { ratePerSec: 1, burst: 1 };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const codes = [];
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    codes.push(res.status);
+  }
+  server.close();
+  assert.deepStrictEqual(codes, [200, 200, 200, 200, 200]); // never 429
+});
+
+test("/api is rate limited per source IP (429 after the burst)", async () => {
+  const deps = fakeDeps();
+  deps.config.rateLimit = { ratePerSec: 1, burst: 2 };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const codes = [];
+  for (let i = 0; i < 4; i++) {
+    const res = await fetch(`http://127.0.0.1:${port}/api/map-styles`);
+    codes.push(res.status);
+  }
+  server.close();
+  assert.ok(codes.slice(0, 2).every((c) => c === 200), `first 2 should pass: ${codes}`);
+  assert.ok(codes.includes(429), `should hit 429 after burst: ${codes}`);
+});
+
+test("allowed CORS origin is echoed on /api responses", async () => {
+  const deps = fakeDeps();
+  deps.config.allowedOrigins = ["https://app.customer.com"];
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/map-styles`, {
+    headers: { Origin: "https://app.customer.com" },
+  });
+  server.close();
+  assert.strictEqual(res.headers.get("access-control-allow-origin"), "https://app.customer.com");
+});
+
+test("disallowed CORS origin gets no allow header", async () => {
+  const deps = fakeDeps();
+  deps.config.allowedOrigins = ["https://app.customer.com"];
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/map-styles`, {
+    headers: { Origin: "https://evil.com" },
+  });
+  server.close();
+  assert.strictEqual(res.headers.get("access-control-allow-origin"), null);
+});
+
+// --- 5xx responses are sanitized: internal/ALS error detail is logged
+// server-side, never leaked to the client. ---
+
+test("a 500 returns a generic message, not the internal error detail", async () => {
+  const deps = fakeDeps();
+  deps.als.suggest = async () => {
+    throw new Error("ALS suggest failed: HTTP 403 in eu-west-1 <secret-ish detail>");
+  };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE`);
+  const body = await res.json();
+  server.close();
+  assert.strictEqual(res.status, 500);
+  assert.strictEqual(body.error, "Internal server error");
+  assert.ok(!/403|secret-ish|eu-west-1/.test(JSON.stringify(body)), "must not leak internal detail");
+});
+
+// --- lat/lng validation: malformed coords are rejected with 400 before they
+// can reach ALS as NaN. ---
+
+test("suggest rejects a malformed lat with 400 (no NaN to ALS)", async () => {
+  const deps = fakeDeps();
+  let called = false;
+  deps.als.suggest = async () => { called = true; return { ResultItems: [] }; };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&lat=abc&lng=103.8`);
+  server.close();
+  assert.strictEqual(res.status, 400);
+  assert.strictEqual(called, false, "als.suggest must not be called with bad coords");
+});
+
+test("tile-region rejects an out-of-range coord with 400", async () => {
+  const deps = fakeDeps();
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/tile-region?lat=999&lng=0`);
+  server.close();
+  assert.strictEqual(res.status, 400);
+});
+
+test("suggest with no coords still works (coords optional)", async () => {
+  const deps = fakeDeps();
+  deps.als.suggest = async () => ({ ResultItems: [] });
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE`);
+  server.close();
+  assert.strictEqual(res.status, 200);
 });

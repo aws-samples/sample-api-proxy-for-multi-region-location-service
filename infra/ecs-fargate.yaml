@@ -49,6 +49,24 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+  AllowedOrigins:
+    Type: String
+    Default: ""
+    Description: "CORS allowlist for /api (comma-separated origins). Empty = same-origin only."
+  ApiRatePerSec:
+    Type: Number
+    Default: 10
+    Description: Sustained per-source-IP request rate for /api (token bucket refill)
+  ApiRateBurst:
+    Type: Number
+    Default: 20
+    Description: Per-source-IP burst capacity for /api (token bucket size)
+  TrustProxy:
+    Type: String
+    Default: "2"
+    Description: >-
+      Express 'trust proxy' hop count. In this stack the chain is CloudFront→ALB
+      (2 hops), so 2 makes the rate-limiter read the real, unspoofable client IP.
   ImageUri:
     Type: String
     Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/location-proxy:latest)
@@ -226,6 +244,14 @@ Resources:
               Value: !Ref MultiRegionRouting
             - Name: MAP_TILE_DOMAIN
               Value: !Ref MapTileDomain
+            - Name: ALLOWED_ORIGINS
+              Value: !Ref AllowedOrigins
+            - Name: API_RATE_PER_SEC
+              Value: !Ref ApiRatePerSec
+            - Name: API_RATE_BURST
+              Value: !Ref ApiRateBurst
+            - Name: TRUST_PROXY
+              Value: !Ref TrustProxy
           Secrets:
             - Name: LOCATION_API_KEYS
               ValueFrom: !Ref LocationApiKeysSecretArn

@@ -50,6 +50,14 @@
   └── 地图瓦片 → CloudFront /<region>/*（边缘缓存 + 注入该区域 key）→ ALS Geo Maps
 ```
 
+## API 防护与安全说明
+
+**CORS（`/api`）** —— 默认关闭：不设置 `ALLOWED_ORIGINS` 时不发送任何 CORS 头，仅同源调用可用。由于后端是交付物、客户可能把自建前端部署在不同源,需要跨域时用 `ALLOWED_ORIGINS` 显式放行这些源。生产环境避免用 `*` —— 那会让任意网站都能调用你的 API、烧掉账号的 ALS 配额。API 不携带 cookie/凭证（key 全在服务端），所以这只关乎"谁能调用",与 CSRF 无关。
+
+**限流（`/api`）** —— 基于源 IP 的令牌桶做基础防护（`API_RATE_PER_SEC` 持续速率 + `API_RATE_BURST` 突发），`/health` 豁免以免 ALB 健康检查被限流打挂。这是**下限,不是 WAF 的替代**：它是**每 task 内存态**的,N 个 ECS task 时全局有效速率最高可达 N × `API_RATE_PER_SEC`。要真正的全局限流,请在其上叠加 WAF 速率规则(或共享存储如 ElastiCache)。`TRUST_PROXY=2`（CloudFront→ALB 的跳数）确保限流以真实、不可伪造的客户端 IP 为键,而非 ALB 的 IP。
+
+**CloudFront → ALB 回源流量（明文）** —— ECS 栈里,对外 HTTPS 在 CloudFront 终结,CloudFront→ALB 这一跳是 HTTP。ALB 虽是 internet-facing,但其**安全组(security group)**只放行 [CloudFront 托管前缀列表](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html),因此无法从公网直接访问。CloudFront 到 AWS 源的回源流量走 **AWS 网络骨干网**、不经公共互联网(AWS 甚至对此免收数据传输费)—— 因此残留暴露面是"运行在 AWS 自有网络上的明文查询词/坐标",而非凭证(ALS key 从不经过这一跳)。我们判断这可接受,默认保持明文。若要连这点也消除:做回源 HTTPS —— 用自有域名给 ALB 配 ACM 证书,并把 CloudFront 回源指向该域名(ALB 缺省的 `*.elb.amazonaws.com` 域名无法绑 ACM 证书,所以需要一个你拥有的域名)。
+
 ## 前置条件
 
 1. AWS 账号，已开通 Amazon Location Service
@@ -72,6 +80,10 @@ home 区域与部署区域相互独立，可相同也可不同（例如：为降
 | `MULTI_REGION_ROUTING` | 总开关，默认 `false`（单区域：一切走 home 区域）。 | `true` |
 | `LOCATION_API_KEYS` | region→API Key 的 JSON（每 key 含 geo-places + geo-maps）。以一个 Secrets Manager secret 提供。 | `{"ap-northeast-1":"v1.public.xxx"}` |
 | `MAP_TILE_DOMAIN` | CloudFront 瓦片域名（CloudFront 栈的输出）。 | `d123.cloudfront.net` |
+| `ALLOWED_ORIGINS` | `/api` 的 CORS 白名单（逗号分隔）。**默认关闭**：不设置则不发 CORS 头，仅同源可调。用 `*` 放行所有源。 | `https://app.example.com` |
+| `API_RATE_PER_SEC` | `/api` 每源 IP 的持续速率（令牌桶补充速率）。默认 `10`。 | `20` |
+| `API_RATE_BURST` | `/api` 每源 IP 的突发容量（令牌桶大小）。默认 `20`。 | `40` |
+| `TRUST_PROXY` | Express `trust proxy` 值——代理跳数，使限流拿到真实、不可伪造的客户端 IP。本地默认 `true`；在 CloudFront→ALB 之后设为 `2`。 | `2` |
 
 > 在用区域**和 home 区域**都**不是**环境变量——它们来自 `config/country-region-map.json`（其 key,以及被 `"*"` 标记的区域）。本地通过 `export` 设置上面这些变量；生产环境通过 CloudFormation 参数传入（见下文）。两种机制相互独立。
 
@@ -247,6 +259,7 @@ aws cloudformation deploy \
 ```
 
 - **单区域**：设 `MultiRegionRouting=false`（home 区域即你在映射里用 `"*"` 标记的那个）。
+- **可选防护参数**（均有合理默认，按需覆盖）：`AllowedOrigins=https://app.example.com`（`/api` 的 CORS 白名单，默认仅同源）、`ApiRatePerSec=10` / `ApiRateBurst=20`（`/api` 每源 IP 限流）、`TrustProxy=2`（CloudFront→ALB 跳数,用于取真实客户端 IP;默认已是 `2`）。详见[API 防护与安全说明](#api-防护与安全说明)。
 
 > **重新部署代码/映射改动**：如果重新 build 并推送到**同一个镜像 tag**（`:latest`），`cloudformation deploy` 会因为参数没变而提示 *"No changes to deploy. Stack xxx is up to date"* ——运行中的任务仍是旧镜像。两种真正生效的方式：
 > - 强制新部署（最简单）：`aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>`（`<cluster>`/`<service>` 取自 stack 的 `ClusterName` / `ServiceName` 输出）。

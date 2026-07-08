@@ -2,13 +2,41 @@ const { test } = require("node:test");
 const assert = require("node:assert");
 const { createAlsClient } = require("../src/alsClient");
 
-// fake fetch that records the URL and returns a canned JSON body
+// fake fetch that records the URL and returns a canned JSON body.
+// Mirrors a real fetch Response (ok/status), which the client relies on.
 function fakeFetch(captured, body) {
   return async (url, opts) => {
     captured.url = url;
     captured.opts = opts;
-    return { json: async () => body };
+    return { ok: true, status: 200, json: async () => body };
   };
+}
+
+// fake fetch that returns a non-ok HTTP response (e.g. 403 bad key, 500).
+function fakeFetchError(status, text = "err") {
+  return async () => ({
+    ok: false,
+    status,
+    text: async () => text,
+    json: async () => ({}),
+  });
+}
+
+// No-op sleep so retry tests don't incur real backoff delays.
+const noSleep = async () => {};
+
+// fetch that replays a scripted sequence of HTTP statuses (the last repeats),
+// counting how many times it was called. 200 returns okBody; anything else is
+// a non-ok response.
+function scriptedFetch(statuses, okBody = { ResultItems: [] }) {
+  const state = { calls: 0 };
+  const impl = async () => {
+    const status = statuses[Math.min(state.calls, statuses.length - 1)];
+    state.calls++;
+    if (status === 200) return { ok: true, status: 200, json: async () => okBody };
+    return { ok: false, status, text: async () => `err ${status}`, json: async () => ({}) };
+  };
+  return { impl, state };
 }
 
 test("reverseGeocodeCountry hits the region's places endpoint and reads Code2", async () => {
@@ -91,4 +119,128 @@ test("getPlace passes an explicit lang", async () => {
   const als = createAlsClient({ fetchImpl: fakeFetch(captured, { Title: "x" }) });
   await als.getPlace({ region: "eu-west-1", key: "k2", placeId: "abc", lang: "zh" });
   assert.match(captured.url, /language=zh/);
+});
+
+test("getPlace URL-encodes the placeId (opaque token, may contain reserved chars)", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { Title: "x" }) });
+  await als.getPlace({ region: "eu-west-1", key: "k2", placeId: "ab/c d+e" });
+  assert.match(captured.url, /\/v2\/place\/ab%2Fc%20d%2Be/);
+});
+
+// --- HTTP error handling: a non-ok response must NOT be mistaken for data. ---
+// Before this, suggest returned {} → [] (looks like "no matches"),
+// reverseGeocodeCountry returned null (silent home fallback), etc.
+
+test("suggest throws on a non-ok HTTP response (not silently empty)", async () => {
+  const als = createAlsClient({ fetchImpl: fakeFetchError(403, "AccessDenied") });
+  await assert.rejects(
+    () => als.suggest({ region: "eu-west-1", key: "bad", query: "x" }),
+    /suggest.*403.*eu-west-1/
+  );
+});
+
+test("getPlace throws on a non-ok HTTP response", async () => {
+  const als = createAlsClient({ fetchImpl: fakeFetchError(500) });
+  await assert.rejects(
+    () => als.getPlace({ region: "eu-west-1", key: "k", placeId: "p" }),
+    /getPlace.*500.*eu-west-1/
+  );
+});
+
+test("getStyleDescriptor throws on a non-ok HTTP response", async () => {
+  const als = createAlsClient({ fetchImpl: fakeFetchError(404) });
+  await assert.rejects(
+    () => als.getStyleDescriptor({ region: "eu-west-1", key: "k", styleName: "Standard" }),
+    /getStyleDescriptor.*404.*eu-west-1/
+  );
+});
+
+test("reverseGeocodeCountry throws on a non-ok HTTP response (caller decides to degrade)", async () => {
+  const als = createAlsClient({ fetchImpl: fakeFetchError(403) });
+  await assert.rejects(
+    () => als.reverseGeocodeCountry({ region: "eu-west-1", key: "bad", lat: 0, lng: 0 }),
+    /reverseGeocode.*403.*eu-west-1/
+  );
+});
+
+// styleExists is a HEAD probe: it already returns resp.ok, so a non-ok
+// response is a legitimate "style not present", NOT an error to throw.
+test("styleExists returns false on a non-ok response (probe, never throws)", async () => {
+  const als = createAlsClient({ fetchImpl: fakeFetchError(404) });
+  const exists = await als.styleExists({ region: "eu-west-1", key: "k", styleName: "Nope" });
+  assert.strictEqual(exists, false);
+});
+
+// --- Bounded retry with backoff: transient failures (429 / 5xx / network)
+// are retried up to `maxRetries` times; non-retryable 4xx throw immediately. ---
+
+test("suggest retries a 429 then succeeds (transient throttling)", async () => {
+  const { impl, state } = scriptedFetch([429, 200]);
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep });
+  const data = await als.suggest({ region: "eu-west-1", key: "k", query: "x" });
+  assert.deepStrictEqual(data, { ResultItems: [] });
+  assert.strictEqual(state.calls, 2); // one retry
+});
+
+test("suggest retries a 503 then succeeds", async () => {
+  const { impl, state } = scriptedFetch([503, 200]);
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep });
+  await als.suggest({ region: "eu-west-1", key: "k", query: "x" });
+  assert.strictEqual(state.calls, 2);
+});
+
+test("retries are bounded: 429 on every attempt throws after maxRetries+1 tries", async () => {
+  const { impl, state } = scriptedFetch([429]); // always throttled
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  await assert.rejects(
+    () => als.suggest({ region: "eu-west-1", key: "k", query: "x" }),
+    /suggest.*429.*eu-west-1/
+  );
+  assert.strictEqual(state.calls, 3); // 1 initial + 2 retries
+});
+
+test("does NOT retry a non-retryable 4xx (expired/invalid key = 403)", async () => {
+  const { impl, state } = scriptedFetch([403]);
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  await assert.rejects(
+    () => als.suggest({ region: "eu-west-1", key: "bad", query: "x" }),
+    /suggest.*403.*eu-west-1/
+  );
+  assert.strictEqual(state.calls, 1); // no retry — fail fast
+});
+
+test("does NOT retry a 404", async () => {
+  const { impl, state } = scriptedFetch([404]);
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  await assert.rejects(() => als.getPlace({ region: "eu-west-1", key: "k", placeId: "p" }));
+  assert.strictEqual(state.calls, 1);
+});
+
+test("retries a network error (fetch rejects) then succeeds", async () => {
+  let calls = 0;
+  const impl = async () => {
+    calls++;
+    if (calls === 1) throw new TypeError("network down");
+    return { ok: true, status: 200, json: async () => ({ ResultItems: [] }) };
+  };
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  await als.suggest({ region: "eu-west-1", key: "k", query: "x" });
+  assert.strictEqual(calls, 2);
+});
+
+test("a network error that never recovers throws after the retry budget", async () => {
+  let calls = 0;
+  const impl = async () => { calls++; throw new TypeError("network down"); };
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 1 });
+  await assert.rejects(() => als.suggest({ region: "eu-west-1", key: "k", query: "x" }), /network down/);
+  assert.strictEqual(calls, 2); // 1 initial + 1 retry
+});
+
+test("reverseGeocodeCountry also retries transient 5xx", async () => {
+  const { impl, state } = scriptedFetch([500, 200], { ResultItems: [{ Address: { Country: { Code2: "SG" } } }] });
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep });
+  const cc = await als.reverseGeocodeCountry({ region: "ap-southeast-1", key: "k", lat: 1.3, lng: 103.8 });
+  assert.strictEqual(cc, "SG");
+  assert.strictEqual(state.calls, 2);
 });

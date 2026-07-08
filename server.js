@@ -5,6 +5,9 @@ const { createMappingStore } = require("./src/mappingStore");
 const { createAlsClient } = require("./src/alsClient");
 const { createReverseGeocoder } = require("./src/reverseGeocoder");
 const { resolveRegion } = require("./src/regionResolver");
+const { parseCoords } = require("./src/coords");
+const { createCorsMiddleware } = require("./src/cors");
+const { createTokenBucketLimiter } = require("./src/rateLimiter");
 const { regionCenter } = require("./config/region-centers");
 
 const PORT = 3000;
@@ -16,9 +19,33 @@ const ALL_STYLES = ["Standard", "Monochrome", "Hybrid", "Satellite"];
 // Build the express app from injected dependencies (testable).
 function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles }) {
   const app = express();
-  app.use(express.static("public"));
+  // Behind CloudFront→ALB, req.ip must be the real (unspoofable) client for
+  // per-IP rate limiting. TRUST_PROXY=2 (the CloudFront+ALB hop count) reads the
+  // IP a fixed distance from the right of X-Forwarded-For so a viewer can't forge
+  // a leftmost entry to dodge the limiter. Defaults to true when not configured.
+  app.set("trust proxy", config.trustProxy ?? true);
+  app.use(express.static(path.join(__dirname, "public")));
+
+  // CORS (default closed) + baseline per-IP rate limit, scoped to /api only.
+  // /health is deliberately NOT under /api so the ALB health check is exempt.
+  app.use("/api", createCorsMiddleware(config.allowedOrigins || []));
+  app.use(
+    "/api",
+    createTokenBucketLimiter({
+      ratePerSec: config.rateLimit?.ratePerSec,
+      burst: config.rateLimit?.burst,
+    })
+  );
 
   const keyFor = (region) => config.keyMap.get(region);
+
+  // Log the full error server-side, return a generic message to the client.
+  // Internal/ALS error detail (status, region, key hints) must never leak to
+  // callers — they get a 500 with a stable, non-revealing body.
+  function fail500(res, context, err) {
+    console.error(`${context}:`, err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 
   // Resolve target region for a request from countryCode or lat/lng.
   async function targetRegionFor({ countryCode, lat, lng }) {
@@ -45,8 +72,10 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   app.get("/api/suggest", async (req, res) => {
     const { query, lat, lng, countryCode, lang } = req.query;
     if (!query) return res.json([]);
+    const coords = parseCoords(lat, lng);
+    if (!coords.valid) return res.status(400).json({ error: coords.error });
     try {
-      const region = await targetRegionFor({ countryCode, lat, lng });
+      const region = await targetRegionFor({ countryCode, lat: coords.lat, lng: coords.lng });
       // Bias selection (BiasPosition is required by ALS suggest). Priority
       // matches the routing contract:
       //   - explicit countryCode -> bias to that region's center (country is
@@ -55,8 +84,8 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       //   - else -> region (HOME) center (always inside coverage; a bias
       //     outside a region's coverage, esp. GrabMaps, can return nothing).
       const [biasLng, biasLat] =
-        !countryCode && lat != null && lng != null
-          ? [parseFloat(lng), parseFloat(lat)]
+        !countryCode && coords.lat != null
+          ? [coords.lng, coords.lat]
           : regionCenter(region).center;
       // countryCode also becomes a hard IncludeCountries filter, so results are
       // constrained to that country regardless of bias ranking.
@@ -85,13 +114,14 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
         }));
       res.json(suggestions);
     } catch (err) {
-      console.error("Suggest error:", err);
-      res.status(500).json({ error: err.message });
+      fail500(res, "Suggest error", err);
     }
   });
 
   app.get("/api/place/:placeId", async (req, res) => {
     const { countryCode, lat, lng, region: regionParam, lang } = req.query;
+    const coords = parseCoords(lat, lng);
+    if (!coords.valid) return res.status(400).json({ error: coords.error });
     try {
       // A PlaceId is region-scoped: GetPlace must run in the region that
       // produced it. The frontend passes ?region=<suggest's region> so we use
@@ -99,7 +129,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       const region =
         regionParam && config.enabledRegions.has(regionParam)
           ? regionParam
-          : await targetRegionFor({ countryCode, lat, lng });
+          : await targetRegionFor({ countryCode, lat: coords.lat, lng: coords.lng });
       const data = await als.getPlace({ region, key: keyFor(region), placeId: req.params.placeId, lang });
       // tileRegion = the region whose map data covers the RESULT's country
       // (not necessarily the region that produced the PlaceId). The frontend
@@ -108,8 +138,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       const tileRegion = (country && mappingStore.getRegion(country)) || config.homeRegion;
       res.json({ label: data.Title, position: data.Position, address: data.Address, tileRegion, country });
     } catch (err) {
-      console.error("GetPlace error:", err);
-      res.status(500).json({ error: err.message });
+      fail500(res, "GetPlace error", err);
     }
   });
 
@@ -117,18 +146,18 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   // HERE suggestions that carry a position (no GetPlace call) so the frontend
   // can still switch tiles to the result's local region.
   app.get("/api/tile-region", async (req, res) => {
-    const { lat, lng } = req.query;
+    const coords = parseCoords(req.query.lat, req.query.lng);
+    if (!coords.valid) return res.status(400).json({ error: coords.error });
     try {
       let tileRegion = config.homeRegion;
       let country = null;
-      if (lat != null && lng != null) {
-        country = await reverseGeocoder.toCountry(parseFloat(lat), parseFloat(lng));
+      if (coords.lat != null) {
+        country = await reverseGeocoder.toCountry(coords.lat, coords.lng);
         if (country) tileRegion = mappingStore.getRegion(country) || config.homeRegion;
       }
       res.json({ tileRegion, country });
     } catch (err) {
-      console.error("tile-region error:", err);
-      res.status(500).json({ error: err.message });
+      fail500(res, "tile-region error", err);
     }
   });
 
@@ -138,18 +167,19 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     if (!availableStyles.includes(styleName)) {
       return res.status(400).json({ error: `Invalid style. Allowed: ${availableStyles.join(", ")}` });
     }
+    const coords = parseCoords(lat, lng);
+    if (!coords.valid) return res.status(400).json({ error: coords.error });
     try {
       // Explicit ?region lets the frontend switch map tiles to a selected
       // result's region (e.g. a Singapore result -> GrabMaps tiles).
       const region =
         regionParam && config.enabledRegions.has(regionParam)
           ? regionParam
-          : await targetRegionFor({ countryCode, lat, lng });
+          : await targetRegionFor({ countryCode, lat: coords.lat, lng: coords.lng });
       const style = await als.getStyleDescriptor({ region, key: keyFor(region), styleName });
       res.json(als.rewriteStyle(style, { region, mapTileDomain: config.mapTileDomain }));
     } catch (err) {
-      console.error("Map style error:", err);
-      res.status(500).json({ error: err.message });
+      fail500(res, "Map style error", err);
     }
   });
 
@@ -166,7 +196,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   return app;
 }
 
-// Detect which styles exist in HOME_REGION (startup).
+// Detect which styles exist in the home region (startup).
 async function detectStyles(als, config) {
   const region = config.homeRegion;
   const key = config.keyMap.get(region);
@@ -179,7 +209,18 @@ async function detectStyles(als, config) {
       }
     })
   );
-  return results.filter(Boolean);
+  const available = results.filter(Boolean);
+  // A transient ALS blip at boot can make every probe fail, leaving a task that
+  // passes /health but serves no styles (empty switcher + 400 on every
+  // map-style). Fail fast instead so ECS never routes traffic to it and
+  // replaces it — a healthy region always has at least "Standard".
+  if (!available.length) {
+    throw new Error(
+      `No map styles detected in home region ${region} (probed: ${ALL_STYLES.join(", ")}). ` +
+        `ALS may be unreachable or the API key is invalid — refusing to start.`
+    );
+  }
+  return available;
 }
 
 async function main() {
@@ -200,14 +241,35 @@ async function main() {
   const availableStyles = await detectStyles(als, config);
 
   const app = buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles });
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`🗺️  Proxy running at http://localhost:${PORT}`);
-    console.log(`   HOME_REGION: ${config.homeRegion}`);
+    console.log(`   Home region (mapping "*"): ${config.homeRegion}`);
     console.log(`   MULTI_REGION_ROUTING: ${config.routingEnabled}`);
     console.log(`   Regions (from mapping): ${[...config.enabledRegions].join(", ")}`);
     console.log(`   Mapping entries: ${mappingStore.size}`);
     console.log(`   Available styles: ${availableStyles.join(", ")}`);
+    console.log(
+      `   CORS allowlist: ${config.allowedOrigins.length ? config.allowedOrigins.join(", ") : "(none — same-origin only)"}`
+    );
+    console.log(`   API rate limit: ${config.rateLimit.ratePerSec}/s (burst ${config.rateLimit.burst}) per source IP`);
   });
+
+  // Graceful shutdown: on ECS deploy/scale-in the task gets SIGTERM. Stop
+  // accepting new connections and let in-flight requests finish before exit, so
+  // a rolling deploy drops zero requests. A timeout guards against hung sockets.
+  const shutdown = (signal) => {
+    console.log(`${signal} received — shutting down gracefully`);
+    server.close(() => {
+      console.log("Closed remaining connections, exiting");
+      process.exit(0);
+    });
+    setTimeout(() => {
+      console.error("Shutdown timed out, forcing exit");
+      process.exit(1);
+    }, 10_000).unref();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 if (require.main === module) {

@@ -21,14 +21,19 @@ test("valid config passes", () => {
   assert.doesNotThrow(() => validateConfig(base()));
 });
 
-test("rejects HOME_REGION not ALS-supported", () => {
+test("rejects home region not ALS-supported (message points at the mapping, not a phantom env var)", () => {
   assert.throws(
     () => validateConfig(base({ homeRegion: "mars-1", enabledRegions: new Set(["mars-1", "eu-west-1"]) })),
-    /HOME_REGION.*ALS/
+    (err) => {
+      assert.match(err.message, /home region.*mars-1.*ALS/i);
+      assert.match(err.message, /"\*".*country-region-map\.json/); // points at the mapping marker
+      assert.doesNotMatch(err.message, /HOME_REGION/); // no such env var exists
+      return true;
+    }
   );
 });
 
-test("routing ON rejects GrabMaps HOME_REGION", () => {
+test("routing ON rejects GrabMaps home region (message points at the mapping)", () => {
   assert.throws(
     () =>
       validateConfig(
@@ -38,7 +43,11 @@ test("routing ON rejects GrabMaps HOME_REGION", () => {
           keyMap: new Map([["ap-southeast-1", "k"], ["eu-west-1", "k2"]]),
         })
       ),
-    /HOME_REGION.*GrabMaps/
+    (err) => {
+      assert.match(err.message, /home region.*ap-southeast-1.*GrabMaps/i);
+      assert.doesNotMatch(err.message, /HOME_REGION/);
+      return true;
+    }
   );
 });
 
@@ -59,6 +68,20 @@ test("rejects a mapping region missing a key", () => {
   assert.throws(
     () => validateConfig(base({ keyMap: new Map([["ap-northeast-1", "k1"]]) })),
     /missing API key.*eu-west-1/
+  );
+});
+
+test("rejects an empty-string API key (would 403 at runtime, not fail fast)", () => {
+  assert.throws(
+    () => validateConfig(base({ keyMap: new Map([["ap-northeast-1", "k1"], ["eu-west-1", ""]]) })),
+    /empty API key.*eu-west-1/i
+  );
+});
+
+test("rejects a whitespace-only API key", () => {
+  assert.throws(
+    () => validateConfig(base({ keyMap: new Map([["ap-northeast-1", "k1"], ["eu-west-1", "   "]]) })),
+    /empty API key.*eu-west-1/i
   );
 });
 
@@ -91,6 +114,48 @@ test("loadConfig throws when MAP_TILE_DOMAIN missing", () => {
     () => loadConfig({ LOCATION_API_KEYS: '{"us-east-1":"k"}' }, { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }),
     /MAP_TILE_DOMAIN/
   );
+});
+
+test("loadConfig defaults: no CORS origins (same-origin) and 10/s burst 20", () => {
+  const cfg = loadConfig(
+    { LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d" },
+    { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }
+  );
+  assert.deepStrictEqual(cfg.allowedOrigins, []);
+  assert.strictEqual(cfg.rateLimit.ratePerSec, 10);
+  assert.strictEqual(cfg.rateLimit.burst, 20);
+});
+
+test("loadConfig trustProxy: numeric hop count, boolean, or default true", () => {
+  const mk = (env) =>
+    loadConfig(
+      { LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d", ...env },
+      { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }
+    );
+  // Numeric string → number (CloudFront+ALB = 2 hops; unspoofable client IP).
+  assert.strictEqual(mk({ TRUST_PROXY: "2" }).trustProxy, 2);
+  // "false" → boolean false (direct, no proxy).
+  assert.strictEqual(mk({ TRUST_PROXY: "false" }).trustProxy, false);
+  // "true" → boolean true.
+  assert.strictEqual(mk({ TRUST_PROXY: "true" }).trustProxy, true);
+  // unset → default true (works out of the box locally).
+  assert.strictEqual(mk({}).trustProxy, true);
+});
+
+test("loadConfig reads ALLOWED_ORIGINS and API rate env overrides", () => {
+  const cfg = loadConfig(
+    {
+      LOCATION_API_KEYS: '{"us-east-1":"k"}',
+      MAP_TILE_DOMAIN: "d",
+      ALLOWED_ORIGINS: "https://a.com, https://b.com",
+      API_RATE_PER_SEC: "25",
+      API_RATE_BURST: "50",
+    },
+    { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }
+  );
+  assert.deepStrictEqual(cfg.allowedOrigins, ["https://a.com", "https://b.com"]);
+  assert.strictEqual(cfg.rateLimit.ratePerSec, 25);
+  assert.strictEqual(cfg.rateLimit.burst, 50);
 });
 
 test("loadConfig parses MULTI_REGION_ROUTING=true", () => {

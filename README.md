@@ -50,6 +50,14 @@ Browser
   └── Map tiles      → CloudFront /<region>/* (edge cache + inject that region's key) → ALS Geo Maps
 ```
 
+## API protection & security notes
+
+**CORS (`/api`)** — Default closed: with `ALLOWED_ORIGINS` unset, no CORS headers are sent, so only same-origin callers work. Because the proxy is the deliverable and a customer may host their own frontend on a different origin, set `ALLOWED_ORIGINS` to opt those origins in. Avoid `*` in production — it lets any website call your API and burn the account's ALS quota. The API carries no cookies/credentials (keys stay server-side), so this is about *who may call*, not CSRF.
+
+**Rate limiting (`/api`)** — A baseline per-source-IP token bucket (`API_RATE_PER_SEC` sustained + `API_RATE_BURST` spike) throttles abuse; `/health` is exempt so the ALB health check is never throttled. This is a **floor, not a WAF replacement**: it is per-task (in-memory), so with N ECS tasks the effective global rate is up to N × `API_RATE_PER_SEC`. For true global limiting, layer a WAF rate-based rule (or a shared store like ElastiCache) on top. `TRUST_PROXY=2` (the CloudFront→ALB hop count) ensures the limiter keys on the real, unspoofable client IP rather than the ALB's.
+
+**CloudFront → ALB origin traffic (plaintext)** — In the ECS stack, viewer-facing HTTPS is terminated at CloudFront; the CloudFront→ALB hop is HTTP. The ALB is internet-facing but its **security group** only admits the [CloudFront managed prefix list](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html), so it isn't directly reachable from the public internet. Origin-fetch traffic from CloudFront to an AWS origin travels over the **AWS network backbone**, not the public internet (AWS even waives data-transfer charges for it) — so the residual exposure is plaintext *query terms/coordinates* on AWS-operated infrastructure, never credentials (the ALS key never traverses this hop). We judge this acceptable and leave it plaintext by default. To eliminate even that, add HTTPS-to-origin: put an ACM certificate on a custom ALB domain and point CloudFront's origin at it (an ALB's default `*.elb.amazonaws.com` name can't hold an ACM cert, so a domain you own is required).
+
 ## Prerequisites
 
 1. An AWS account with Amazon Location Service enabled
@@ -72,6 +80,10 @@ The home region and the deploy region are independent: they can be the same or d
 | `MULTI_REGION_ROUTING` | Master switch; defaults to `false` (single-region: everything uses the home region). | `true` |
 | `LOCATION_API_KEYS` | JSON of region→API Key (each key has geo-places + geo-maps). Provided as one Secrets Manager secret. | `{"ap-northeast-1":"v1.public.xxx"}` |
 | `MAP_TILE_DOMAIN` | CloudFront map-tile domain (output of the CloudFront stack). | `d123.cloudfront.net` |
+| `ALLOWED_ORIGINS` | CORS allowlist for `/api` (comma-separated). **Default closed**: unset ⇒ no CORS headers ⇒ same-origin only. Use `*` to allow any origin. | `https://app.example.com` |
+| `API_RATE_PER_SEC` | Sustained per-source-IP request rate for `/api` (token-bucket refill). Default `10`. | `20` |
+| `API_RATE_BURST` | Per-source-IP burst capacity for `/api` (bucket size). Default `20`. | `40` |
+| `TRUST_PROXY` | Express `trust proxy` value — the proxy hop count so the rate limiter sees the real, unspoofable client IP. Default `true` locally; set to `2` behind CloudFront→ALB. | `2` |
 
 > The regions in use **and the home region** are **not** environment variables — they come from `config/country-region-map.json` (its keys, and the `"*"`-marked region). Locally the variables above are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
 
@@ -247,6 +259,7 @@ aws cloudformation deploy \
 ```
 
 - **Single-region**: set `MultiRegionRouting=false` (the home region is whatever you marked `"*"` in the mapping).
+- **Optional protection params** (sensible defaults, override as needed): `AllowedOrigins=https://app.example.com` (CORS allowlist for `/api`, default same-origin only), `ApiRatePerSec=10` / `ApiRateBurst=20` (per-source-IP `/api` rate limit), `TrustProxy=2` (CloudFront→ALB hop count for the real client IP; default already `2`). See [API protection & security notes](#api-protection--security-notes).
 
 > **Redeploying code/mapping changes**: if you rebuild and push to the **same image tag** (`:latest`), `cloudformation deploy` sees no parameter change and reports *"No changes to deploy. Stack xxx is up to date"* — the running tasks keep the old image. Two ways to actually roll out:
 > - Force a new deployment (simplest): `aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>` (get `<cluster>`/`<service>` from the stack's `ClusterName` / `ServiceName` outputs).

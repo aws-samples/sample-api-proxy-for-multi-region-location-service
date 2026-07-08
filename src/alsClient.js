@@ -11,7 +11,66 @@ function cleanProps(obj) {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== null));
 }
 
-function createAlsClient({ fetchImpl = fetch } = {}) {
+// Throw on a non-ok ALS response so an HTTP error (expired key, throttling,
+// bad region) is never mistaken for valid data. Without this, suggest returns
+// an empty list (looks like "no matches"), reverse-geocode returns null (silent
+// home fallback), and getPlace/getStyleDescriptor return an error body as if it
+// were a Place/style. `op` names the call for the log/error; `region` locates it.
+async function ensureOk(resp, op, region) {
+  if (resp.ok) return resp;
+  let detail = "";
+  try {
+    detail = (await resp.text()).slice(0, 200);
+  } catch {
+    /* body may be unreadable; the status is enough */
+  }
+  console.error(`[als] ${op} failed: HTTP ${resp.status} in ${region} ${detail}`);
+  throw new Error(`ALS ${op} failed: HTTP ${resp.status} in ${region}`);
+}
+
+// Transient failures worth retrying: throttling (429) and server errors (5xx).
+// A 4xx like 403 (expired/invalid key) or 404 is a hard error — retrying it
+// just wastes time and delays the inevitable failure, so we fail fast on those.
+function isRetryableStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// fetchImpl: injectable fetch (tests). sleep: injectable backoff (tests use a
+// no-op). maxRetries: how many times to retry a TRANSIENT failure after the
+// first attempt (default 2 → up to 3 attempts total). backoffMs: base delay,
+// doubled each retry.
+function createAlsClient({ fetchImpl = fetch, sleep = defaultSleep, maxRetries = 2, backoffMs = 200 } = {}) {
+  // Do a fetch and return an ok response, retrying transient failures (429 /
+  // 5xx / network errors) with exponential backoff. Non-retryable responses
+  // (4xx) throw immediately; a transient failure that never recovers throws
+  // once the retry budget is exhausted.
+  async function fetchOk(url, opts, op, region) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) await sleep(backoffMs * 2 ** (attempt - 1));
+      let resp;
+      try {
+        resp = await fetchImpl(url, opts);
+      } catch (err) {
+        // Network-level failure (fetch rejected): retry if budget remains.
+        if (attempt < maxRetries) {
+          console.warn(`[als] ${op} network error in ${region} (attempt ${attempt + 1}), retrying: ${err.message}`);
+          continue;
+        }
+        throw err;
+      }
+      if (resp.ok) return resp;
+      if (isRetryableStatus(resp.status) && attempt < maxRetries) {
+        console.warn(`[als] ${op} HTTP ${resp.status} in ${region} (attempt ${attempt + 1}), retrying`);
+        continue;
+      }
+      // Non-retryable, or transient but out of budget → throw with detail.
+      return ensureOk(resp, op, region);
+    }
+    // Unreachable: the loop either returns an ok response or throws above.
+  }
+
   // lang controls the result display language only (not input); defaults to en
   // (this proxy targets overseas regions). includeCountries (ISO codes) becomes
   // a hard Filter.IncludeCountries — it coexists with BiasPosition and overrides
@@ -23,23 +82,37 @@ function createAlsClient({ fetchImpl = fetch } = {}) {
     if (includeCountries && includeCountries.length) {
       body.Filter = { IncludeCountries: includeCountries };
     }
-    const resp = await fetchImpl(`${placesEndpoint(region)}/v2/suggest?${params}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const resp = await fetchOk(
+      `${placesEndpoint(region)}/v2/suggest?${params}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      "suggest",
+      region
+    );
     return resp.json();
   }
 
   async function getPlace({ region, key, placeId, lang }) {
     const params = new URLSearchParams({ key, language: lang || "en" });
-    const resp = await fetchImpl(`${placesEndpoint(region)}/v2/place/${placeId}?${params}`);
+    // placeId is an opaque ALS token that may contain reserved URL characters.
+    const resp = await fetchOk(
+      `${placesEndpoint(region)}/v2/place/${encodeURIComponent(placeId)}?${params}`,
+      undefined,
+      "getPlace",
+      region
+    );
     return resp.json();
   }
 
   async function getStyleDescriptor({ region, key, styleName }) {
-    const resp = await fetchImpl(
-      `${mapsOrigin(region)}/v2/styles/${styleName}/descriptor?key=${key}`
+    const resp = await fetchOk(
+      `${mapsOrigin(region)}/v2/styles/${styleName}/descriptor?key=${key}`,
+      undefined,
+      "getStyleDescriptor",
+      region
     );
     return resp.json();
   }
@@ -55,11 +128,16 @@ function createAlsClient({ fetchImpl = fetch } = {}) {
   // reverse-geocode a position to an ISO alpha-2 country code (or null).
   async function reverseGeocodeCountry({ region, key, lat, lng }) {
     const params = new URLSearchParams({ key });
-    const resp = await fetchImpl(`${placesEndpoint(region)}/v2/reverse-geocode?${params}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ QueryPosition: [parseFloat(lng), parseFloat(lat)], MaxResults: 1 }),
-    });
+    const resp = await fetchOk(
+      `${placesEndpoint(region)}/v2/reverse-geocode?${params}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ QueryPosition: [parseFloat(lng), parseFloat(lat)], MaxResults: 1 }),
+      },
+      "reverseGeocode",
+      region
+    );
     const data = await resp.json();
     const item = (data.ResultItems || [])[0];
     return item?.Address?.Country?.Code2 || null;

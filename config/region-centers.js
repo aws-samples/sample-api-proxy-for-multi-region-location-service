@@ -14,6 +14,7 @@ const REGION_CENTERS = {
   "eu-west-1": { center: [-6.26, 53.35], zoom: 4 }, // Dublin
   "eu-west-2": { center: [-0.13, 51.51], zoom: 4 }, // London
   "eu-central-1": { center: [8.68, 50.11], zoom: 4 }, // Frankfurt
+  "eu-south-2": { center: [-3.7, 40.42], zoom: 4 }, // Madrid (Spain)
   "eu-north-1": { center: [18.07, 59.33], zoom: 4 }, // Stockholm
   "ap-south-1": { center: [72.88, 19.08], zoom: 4 }, // Mumbai
   "ap-northeast-1": { center: [139.77, 35.68], zoom: 4 }, // Tokyo

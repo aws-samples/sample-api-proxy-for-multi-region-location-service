@@ -38,3 +38,35 @@ test("passes homeRegion and its key to the underlying call", async () => {
   assert.strictEqual(seen.region, "ap-northeast-1");
   assert.strictEqual(seen.key, "k1");
 });
+
+test("degrades to null when the underlying reverse-geocode throws", async () => {
+  // reverse-geocode is a best-effort routing guess; an ALS error must degrade
+  // to null (→ caller falls back to home region), not crash the request.
+  const rg = createReverseGeocoder({
+    homeRegion: "ap-northeast-1",
+    getKey: () => "k1",
+    reverseGeocodeCountry: async () => {
+      throw new Error("ALS 403");
+    },
+  });
+  const cc = await rg.toCountry(35.6, 139.7);
+  assert.strictEqual(cc, null);
+});
+
+test("does NOT cache a thrown failure (transient errors must be retryable)", async () => {
+  let calls = 0;
+  const rg = createReverseGeocoder({
+    homeRegion: "ap-northeast-1",
+    getKey: () => "k1",
+    reverseGeocodeCountry: async () => {
+      calls++;
+      if (calls === 1) throw new Error("transient");
+      return "JP";
+    },
+  });
+  const first = await rg.toCountry(35.6, 139.7); // throws inside → null, not cached
+  const second = await rg.toCountry(35.62, 139.72); // same grid, retried → JP
+  assert.strictEqual(first, null);
+  assert.strictEqual(second, "JP");
+  assert.strictEqual(calls, 2);
+});
