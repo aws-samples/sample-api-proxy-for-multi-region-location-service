@@ -67,6 +67,13 @@ Parameters:
     Description: >-
       Express 'trust proxy' hop count. In this stack the chain is CloudFront→ALB
       (2 hops), so 2 makes the rate-limiter read the real, unspoofable client IP.
+  ReverseGeoCacheMax:
+    Type: Number
+    Default: 200000
+    Description: >-
+      FIFO cap for the per-task reverse-geocode grid cache (backstop against
+      unbounded growth). ~few tens of MB at the default; raise for very
+      geographically-diverse traffic.
   ImageUri:
     Type: String
     Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/location-proxy:latest)
@@ -252,6 +259,8 @@ Resources:
               Value: !Ref ApiRateBurst
             - Name: TRUST_PROXY
               Value: !Ref TrustProxy
+            - Name: REVERSE_GEO_CACHE_MAX
+              Value: !Ref ReverseGeoCacheMax
           Secrets:
             - Name: LOCATION_API_KEYS
               ValueFrom: !Ref LocationApiKeysSecretArn

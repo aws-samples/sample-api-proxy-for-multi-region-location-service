@@ -237,6 +237,7 @@ async function main() {
     homeRegion: config.homeRegion,
     getKey: (r) => config.keyMap.get(r),
     reverseGeocodeCountry: als.reverseGeocodeCountry,
+    maxSize: config.reverseGeoCacheMax,
   });
   const availableStyles = await detectStyles(als, config);
 

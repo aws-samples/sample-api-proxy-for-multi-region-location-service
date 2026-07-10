@@ -70,3 +70,45 @@ test("does NOT cache a thrown failure (transient errors must be retryable)", asy
   assert.strictEqual(second, "JP");
   assert.strictEqual(calls, 2);
 });
+
+test("cache is bounded (FIFO): stays at maxSize, evicts the oldest entry", async () => {
+  let calls = 0;
+  const rg = createReverseGeocoder({
+    homeRegion: "ap-northeast-1",
+    getKey: () => "k1",
+    reverseGeocodeCountry: async () => { calls++; return "JP"; },
+    maxSize: 3,
+  });
+  // Fill 3 distinct grid cells (0.1° apart so keys differ).
+  await rg.toCountry(0.0, 0.0);
+  await rg.toCountry(0.0, 0.2);
+  await rg.toCountry(0.0, 0.4);
+  assert.strictEqual(rg.cacheSize(), 3);
+  assert.strictEqual(calls, 3);
+
+  // A 4th distinct cell evicts the oldest (0,0); still capped at 3.
+  await rg.toCountry(0.0, 0.6);
+  assert.strictEqual(rg.cacheSize(), 3);
+  assert.strictEqual(calls, 4);
+
+  // (0,0) was evicted → a repeat re-fetches (miss); (0,0.6) is still cached (hit).
+  await rg.toCountry(0.0, 0.0);
+  assert.strictEqual(calls, 5, "evicted oldest cell should miss and re-fetch");
+  await rg.toCountry(0.0, 0.6);
+  assert.strictEqual(calls, 5, "most-recent cell should still be a cache hit");
+});
+
+test("a cache hit does not count toward eviction growth", async () => {
+  let calls = 0;
+  const rg = createReverseGeocoder({
+    homeRegion: "ap-northeast-1",
+    getKey: () => "k1",
+    reverseGeocodeCountry: async () => { calls++; return "JP"; },
+    maxSize: 2,
+  });
+  await rg.toCountry(0.0, 0.0);
+  await rg.toCountry(0.0, 0.0); // hit, no new entry
+  await rg.toCountry(0.0, 0.0); // hit
+  assert.strictEqual(rg.cacheSize(), 1);
+  assert.strictEqual(calls, 1);
+});

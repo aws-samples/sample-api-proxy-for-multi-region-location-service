@@ -124,6 +124,15 @@ test("loadConfig defaults: no CORS origins (same-origin) and 10/s burst 20", () 
   assert.deepStrictEqual(cfg.allowedOrigins, []);
   assert.strictEqual(cfg.rateLimit.ratePerSec, 10);
   assert.strictEqual(cfg.rateLimit.burst, 20);
+  assert.strictEqual(cfg.reverseGeoCacheMax, 200_000);
+});
+
+test("loadConfig reads REVERSE_GEO_CACHE_MAX override", () => {
+  const cfg = loadConfig(
+    { LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d", REVERSE_GEO_CACHE_MAX: "50000" },
+    { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }
+  );
+  assert.strictEqual(cfg.reverseGeoCacheMax, 50000);
 });
 
 test("loadConfig trustProxy: numeric hop count, boolean, or default true", () => {
@@ -140,6 +149,28 @@ test("loadConfig trustProxy: numeric hop count, boolean, or default true", () =>
   assert.strictEqual(mk({ TRUST_PROXY: "true" }).trustProxy, true);
   // unset → default true (works out of the box locally).
   assert.strictEqual(mk({}).trustProxy, true);
+});
+
+test("loadConfig trustProxy: an UNRECOGNIZED value degrades to false (fail safe), not true", () => {
+  // A typo like "tw" must NOT silently become `true` — that would trust every
+  // proxy hop and make the rate-limiter's client IP spoofable. Fail safe to
+  // `false` (ALB IP → limiter stricter, but IP unspoofable) and warn.
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    const cfg = loadConfig(
+      { LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d", TRUST_PROXY: "tw" },
+      { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }
+    );
+    assert.strictEqual(cfg.trustProxy, false);
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(
+    warnings.some((w) => /TRUST_PROXY/.test(w) && /tw/.test(w)),
+    `expected a warning naming the bad value; got: ${JSON.stringify(warnings)}`
+  );
 });
 
 test("loadConfig reads ALLOWED_ORIGINS and API rate env overrides", () => {

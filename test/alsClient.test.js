@@ -164,12 +164,58 @@ test("reverseGeocodeCountry throws on a non-ok HTTP response (caller decides to 
   );
 });
 
-// styleExists is a HEAD probe: it already returns resp.ok, so a non-ok
-// response is a legitimate "style not present", NOT an error to throw.
+// styleExists is a HEAD probe: a non-ok HTTP response (e.g. 404) is a
+// legitimate "style not present" and returns false — it must NOT throw.
 test("styleExists returns false on a non-ok response (probe, never throws)", async () => {
   const als = createAlsClient({ fetchImpl: fakeFetchError(404) });
   const exists = await als.styleExists({ region: "eu-west-1", key: "k", styleName: "Nope" });
   assert.strictEqual(exists, false);
+});
+
+test("styleExists returns true on ok", async () => {
+  const als = createAlsClient({ fetchImpl: async () => ({ ok: true, status: 200 }) });
+  assert.strictEqual(await als.styleExists({ region: "eu-west-1", key: "k", styleName: "Standard" }), true);
+});
+
+// A network BLIP (fetch rejects) is "probe failed", NOT "style absent". It must
+// be retried (so a transient blip at startup doesn't permanently hide a style),
+// and only throw if it never recovers — detectStyles' catch then treats the
+// throw as "unknown", distinct from a definitive false.
+test("styleExists retries a network error then succeeds", async () => {
+  let calls = 0;
+  const impl = async () => {
+    calls++;
+    if (calls === 1) throw new TypeError("network down");
+    return { ok: true, status: 200 };
+  };
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  assert.strictEqual(await als.styleExists({ region: "eu-west-1", key: "k", styleName: "Standard" }), true);
+  assert.strictEqual(calls, 2);
+});
+
+test("styleExists retries a 5xx then returns the recovered result", async () => {
+  const { impl, state } = scriptedFetch([503, 200]);
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep });
+  const exists = await als.styleExists({ region: "eu-west-1", key: "k", styleName: "Standard" });
+  assert.strictEqual(exists, true);
+  assert.strictEqual(state.calls, 2);
+});
+
+test("styleExists throws (does NOT return false) when a network error never recovers", async () => {
+  const impl = async () => { throw new TypeError("network down"); };
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 1 });
+  await assert.rejects(
+    () => als.styleExists({ region: "eu-west-1", key: "k", styleName: "Standard" }),
+    /network down/
+  );
+});
+
+test("styleExists does NOT retry a 404 (definitive 'absent', returns false immediately)", async () => {
+  const { impl, state } = scriptedFetch([404]);
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  const exists = await als.styleExists({ region: "eu-west-1", key: "k", styleName: "Nope" });
+  assert.strictEqual(exists, false);
+  assert.strictEqual(state.calls, 1); // no retry — 404 is a real answer
 });
 
 // --- Bounded retry with backoff: transient failures (429 / 5xx / network)
@@ -235,6 +281,30 @@ test("a network error that never recovers throws after the retry budget", async 
   const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 1 });
   await assert.rejects(() => als.suggest({ region: "eu-west-1", key: "k", query: "x" }), /network down/);
   assert.strictEqual(calls, 2); // 1 initial + 1 retry
+});
+
+test("network-error retry log does NOT include the error message (may carry the key-bearing URL)", async () => {
+  // Some fetch impls put the request URL (which carries ?key=...) in the error
+  // message. The retry log must never echo it — log op + region only.
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let calls = 0;
+  const impl = async () => {
+    calls++;
+    if (calls === 1) throw new Error("request to https://places.geo.eu-west-1.amazonaws.com/v2/suggest?key=SECRETKEY failed");
+    return { ok: true, status: 200, json: async () => ({ ResultItems: [] }) };
+  };
+  const als = createAlsClient({ fetchImpl: impl, sleep: noSleep, maxRetries: 2 });
+  try {
+    await als.suggest({ region: "eu-west-1", key: "SECRETKEY", query: "x" });
+  } finally {
+    console.warn = origWarn;
+  }
+  const joined = warnings.join("\n");
+  assert.ok(/eu-west-1/.test(joined), "should still name the region");
+  assert.ok(!/SECRETKEY/.test(joined), `log must not leak the key: ${joined}`);
+  assert.ok(!/key=/.test(joined), `log must not leak a key= query string: ${joined}`);
 });
 
 test("reverseGeocodeCountry also retries transient 5xx", async () => {

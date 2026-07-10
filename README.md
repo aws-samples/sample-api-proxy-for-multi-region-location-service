@@ -83,7 +83,8 @@ The home region and the deploy region are independent: they can be the same or d
 | `ALLOWED_ORIGINS` | CORS allowlist for `/api` (comma-separated). **Default closed**: unset ⇒ no CORS headers ⇒ same-origin only. Use `*` to allow any origin. | `https://app.example.com` |
 | `API_RATE_PER_SEC` | Sustained per-source-IP request rate for `/api` (token-bucket refill). Default `10`. | `20` |
 | `API_RATE_BURST` | Per-source-IP burst capacity for `/api` (bucket size). Default `20`. | `40` |
-| `TRUST_PROXY` | Express `trust proxy` value — the proxy hop count so the rate limiter sees the real, unspoofable client IP. Default `true` locally; set to `2` behind CloudFront→ALB. | `2` |
+| `TRUST_PROXY` | Express `trust proxy` value — the proxy hop count so the rate limiter sees the real, unspoofable client IP. Default `true` locally; set to `2` behind CloudFront→ALB. An unrecognized value fails safe to `false` (with a warning). | `2` |
+| `REVERSE_GEO_CACHE_MAX` | FIFO cap for the per-task reverse-geocode grid cache (backstop against unbounded growth). Default `200000`. | `200000` |
 
 > The regions in use **and the home region** are **not** environment variables — they come from `config/country-region-map.json` (its keys, and the `"*"`-marked region). Locally the variables above are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
 

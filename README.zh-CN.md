@@ -83,7 +83,8 @@ home 区域与部署区域相互独立，可相同也可不同（例如：为降
 | `ALLOWED_ORIGINS` | `/api` 的 CORS 白名单（逗号分隔）。**默认关闭**：不设置则不发 CORS 头，仅同源可调。用 `*` 放行所有源。 | `https://app.example.com` |
 | `API_RATE_PER_SEC` | `/api` 每源 IP 的持续速率（令牌桶补充速率）。默认 `10`。 | `20` |
 | `API_RATE_BURST` | `/api` 每源 IP 的突发容量（令牌桶大小）。默认 `20`。 | `40` |
-| `TRUST_PROXY` | Express `trust proxy` 值——代理跳数，使限流拿到真实、不可伪造的客户端 IP。本地默认 `true`；在 CloudFront→ALB 之后设为 `2`。 | `2` |
+| `TRUST_PROXY` | Express `trust proxy` 值——代理跳数，使限流拿到真实、不可伪造的客户端 IP。本地默认 `true`；在 CloudFront→ALB 之后设为 `2`。无法识别的值会安全退化为 `false`（并打告警）。 | `2` |
+| `REVERSE_GEO_CACHE_MAX` | 反解网格缓存的 FIFO 上限（每任务，防止无界增长的兜底）。默认 `200000`。 | `200000` |
 
 > 在用区域**和 home 区域**都**不是**环境变量——它们来自 `config/country-region-map.json`（其 key,以及被 `"*"` 标记的区域）。本地通过 `export` 设置上面这些变量；生产环境通过 CloudFormation 参数传入（见下文）。两种机制相互独立。
 

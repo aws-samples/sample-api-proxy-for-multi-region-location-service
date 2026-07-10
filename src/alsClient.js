@@ -46,16 +46,21 @@ function createAlsClient({ fetchImpl = fetch, sleep = defaultSleep, maxRetries =
   // 5xx / network errors) with exponential backoff. Non-retryable responses
   // (4xx) throw immediately; a transient failure that never recovers throws
   // once the retry budget is exhausted.
-  async function fetchOk(url, opts, op, region) {
+  // opts.probe (bool): in probe mode a non-ok HTTP status is a valid answer
+  // (e.g. HEAD 404 = "not present"), so the response is RETURNED rather than
+  // thrown — only network errors and retryable 5xx/429 are retried/thrown.
+  // Non-probe (default): a non-ok status throws via ensureOk.
+  async function fetchOk(url, fetchOpts, op, region, { probe = false } = {}) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) await sleep(backoffMs * 2 ** (attempt - 1));
       let resp;
       try {
-        resp = await fetchImpl(url, opts);
+        resp = await fetchImpl(url, fetchOpts);
       } catch (err) {
         // Network-level failure (fetch rejected): retry if budget remains.
+        // Log op + region only — err.message may carry the key-bearing URL.
         if (attempt < maxRetries) {
-          console.warn(`[als] ${op} network error in ${region} (attempt ${attempt + 1}), retrying: ${err.message}`);
+          console.warn(`[als] ${op} network error in ${region} (attempt ${attempt + 1}), retrying`);
           continue;
         }
         throw err;
@@ -65,10 +70,12 @@ function createAlsClient({ fetchImpl = fetch, sleep = defaultSleep, maxRetries =
         console.warn(`[als] ${op} HTTP ${resp.status} in ${region} (attempt ${attempt + 1}), retrying`);
         continue;
       }
-      // Non-retryable, or transient but out of budget → throw with detail.
+      // Non-retryable status, or out of budget. In probe mode a non-ok status
+      // (e.g. 404) is a legitimate answer — return it. Otherwise throw.
+      if (probe) return resp;
       return ensureOk(resp, op, region);
     }
-    // Unreachable: the loop either returns an ok response or throws above.
+    // Unreachable: the loop either returns a response or throws above.
   }
 
   // lang controls the result display language only (not input); defaults to en
@@ -117,10 +124,16 @@ function createAlsClient({ fetchImpl = fetch, sleep = defaultSleep, maxRetries =
     return resp.json();
   }
 
+  // Probe whether a style exists (HEAD). Uses probe mode: a network blip or 5xx
+  // is retried (and throws if it never recovers, so the caller can tell "probe
+  // failed" from "style absent"); a definitive non-ok like 404 → false.
   async function styleExists({ region, key, styleName }) {
-    const resp = await fetchImpl(
+    const resp = await fetchOk(
       `${mapsOrigin(region)}/v2/styles/${styleName}/descriptor?key=${key}`,
-      { method: "HEAD" }
+      { method: "HEAD" },
+      "styleExists",
+      region,
+      { probe: true }
     );
     return resp.ok;
   }

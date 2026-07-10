@@ -5,8 +5,13 @@ function gridKey(lat, lng) {
 }
 
 // Build a reverse geocoder that resolves [lat,lng] -> ISO country code using
-// the home region, cached by grid cell. reverseGeocodeCountry is injected (alsClient).
-function createReverseGeocoder({ homeRegion, getKey, reverseGeocodeCountry }) {
+// the home region, cached by grid cell. reverseGeocodeCountry is injected
+// (alsClient). maxSize bounds the cache (FIFO): grid cells are finite but a
+// long-running, globally-distributed workload would otherwise grow the Map
+// unbounded, so at the cap the oldest-inserted entry is evicted. Per-task
+// (in-process), like the rate limiter — sized generously since it's a
+// backstop, not the primary sizing knob.
+function createReverseGeocoder({ homeRegion, getKey, reverseGeocodeCountry, maxSize = 200_000 }) {
   const cache = new Map();
   async function toCountry(lat, lng) {
     const k = gridKey(lat, lng);
@@ -27,10 +32,15 @@ function createReverseGeocoder({ homeRegion, getKey, reverseGeocodeCountry }) {
       console.warn(`[reverse-geo] ${homeRegion} lookup failed, degrading to home: ${err.message}`);
       return null;
     }
+    // FIFO eviction: Map preserves insertion order, so the first key is the
+    // oldest. Evict before inserting to keep size at the cap.
+    if (cache.size >= maxSize) {
+      cache.delete(cache.keys().next().value);
+    }
     cache.set(k, cc);
     return cc;
   }
-  return { toCountry };
+  return { toCountry, cacheSize: () => cache.size };
 }
 
 module.exports = { gridKey, createReverseGeocoder };

@@ -43,13 +43,21 @@ function validateConfig(cfg) {
 }
 
 // Parse TRUST_PROXY into what Express `set('trust proxy', …)` accepts: a hop
-// count (number), a boolean, or the default (true) when unset.
+// count (number), a boolean, or the default (true) when unset. An UNRECOGNIZED
+// value (e.g. a typo like "tw") fails SAFE to `false` + a warning: `true` would
+// silently trust every proxy hop and make the rate-limiter's client IP
+// spoofable, whereas `false` only makes limiting stricter (uses the ALB IP).
 function parseTrustProxy(value) {
   if (value === undefined || value === "") return true;
   if (value === "true") return true;
   if (value === "false") return false;
   const n = Number(value);
-  return Number.isFinite(n) ? n : true;
+  if (Number.isFinite(n)) return n;
+  console.warn(
+    `[config] TRUST_PROXY "${value}" is not recognized (expected a number, "true", or ` +
+      `"false"); defaulting to false so the rate-limiter client IP stays unspoofable`
+  );
+  return false;
 }
 
 // Read raw config from process.env plus the mapping-derived region set and home
@@ -78,6 +86,9 @@ function loadConfig(env = process.env, mapping = {}) {
   // in the CloudFront+ALB topology. Accepts a number, "true"/"false", or defaults
   // to true (convenient locally; production should pin the hop count).
   const trustProxy = parseTrustProxy(env.TRUST_PROXY);
+  // FIFO bound for the reverse-geocode grid cache (per-task backstop against
+  // unbounded growth on a long-running, globally-distributed workload).
+  const reverseGeoCacheMax = Number(env.REVERSE_GEO_CACHE_MAX) || 200_000;
   const cfg = {
     homeRegion,
     routingEnabled,
@@ -87,6 +98,7 @@ function loadConfig(env = process.env, mapping = {}) {
     allowedOrigins,
     rateLimit,
     trustProxy,
+    reverseGeoCacheMax,
   };
   return validateConfig(cfg);
 }
