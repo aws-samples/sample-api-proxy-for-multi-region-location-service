@@ -116,6 +116,7 @@ ${functions}
       DistributionConfig:
         Enabled: true
         Comment: ALS Map Tile Proxy (multi-region)
+        HttpVersion: http2and3
         DefaultCacheBehavior:
           TargetOriginId: ${defaultName}Origin
           ViewerProtocolPolicy: https-only

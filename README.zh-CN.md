@@ -54,9 +54,13 @@
 
 **CORS（`/api`）** —— 默认关闭：不设置 `ALLOWED_ORIGINS` 时不发送任何 CORS 头，仅同源调用可用。由于后端是交付物、客户可能把自建前端部署在不同源,需要跨域时用 `ALLOWED_ORIGINS` 显式放行这些源。生产环境避免用 `*` —— 那会让任意网站都能调用你的 API、烧掉账号的 ALS 配额。API 不携带 cookie/凭证（key 全在服务端），所以这只关乎"谁能调用",与 CSRF 无关。
 
-**限流（`/api`）** —— 基于源 IP 的令牌桶做基础防护（`API_RATE_PER_SEC` 持续速率 + `API_RATE_BURST` 突发），`/health` 豁免以免 ALB 健康检查被限流打挂。这是**下限,不是 WAF 的替代**：它是**每 task 内存态**的,N 个 ECS task 时全局有效速率最高可达 N × `API_RATE_PER_SEC`。要真正的全局限流,请在其上叠加 WAF 速率规则(或共享存储如 ElastiCache)。`TRUST_PROXY=2`（CloudFront→ALB 的跳数）确保限流以真实、不可伪造的客户端 IP 为键,而非 ALB 的 IP。
+**限流（`/api`）** —— 基于源 IP 的令牌桶做基础防护（`API_RATE_PER_SEC` 持续速率 + `API_RATE_BURST` 突发），`/health` 豁免以免 ALB 健康检查被限流打挂。这是**下限,不是 WAF 的替代**：它是**每 task 内存态**的,N 个 ECS task 时全局速率最高可达 N × `API_RATE_PER_SEC`。要在 CloudFront 边缘做全局上限,挂上可选的 WAF 规则（[步骤 4](#4-可选用-aws-waf-做边缘限流)）。`TRUST_PROXY=2`（CloudFront→ALB 的跳数）确保限流以真实、不可伪造的客户端 IP 为键,而非 ALB 的 IP。
 
-**CloudFront → ALB 回源流量（明文）** —— ECS 栈里,对外 HTTPS 在 CloudFront 终结,CloudFront→ALB 这一跳是 HTTP。ALB 虽是 internet-facing,但其**安全组(security group)**只放行 [CloudFront 托管前缀列表](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html),因此无法从公网直接访问。CloudFront 到 AWS 源的回源流量走 **AWS 网络骨干网**、不经公共互联网(AWS 甚至对此免收数据传输费)—— 因此残留暴露面是"运行在 AWS 自有网络上的明文查询词/坐标",而非凭证(ALS key 从不经过这一跳)。我们判断这可接受,默认保持明文。若要连这点也消除:做回源 HTTPS —— 用自有域名给 ALB 配 ACM 证书,并把 CloudFront 回源指向该域名(ALB 缺省的 `*.elb.amazonaws.com` 域名无法绑 ACM 证书,所以需要一个你拥有的域名)。
+**CloudFront → ALB 回源防护** —— ALB 虽是 internet-facing,但有两道控制确保只能经过*本*分发访问它:其**安全组**只放行 [CloudFront 托管前缀列表](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html);其监听器**在请求缺少本分发注入的 `X-Origin-Verify` 共享密钥头时直接返回 403**（`OriginVerifySecret`）。由于前缀列表覆盖*所有* CloudFront 分发,这个密钥头才是阻止别人把自己的分发指向你 ALB 的 DNS 的关键。（健康检查直连目标,不受影响。）
+
+**CloudFront → ALB 回源流量（明文）** —— 对外 HTTPS 在 CloudFront 终结,CloudFront→ALB 这一跳是 HTTP,但走 **AWS 骨干网**、不经公共互联网。因此残留暴露面是"AWS 自有网络上的明文查询词/坐标",而非凭证(ALS key 和 `X-Origin-Verify` 密钥都不会离开骨干网)。默认保持明文;若要加密:用自有域名给 ALB 配 ACM 证书,并把 CloudFront 回源指向该域名(缺省的 `*.elb.amazonaws.com` 域名无法绑 ACM 证书)。
+
+**安全响应头** —— 每个响应都带有 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Content-Security-Policy: frame-ancestors 'none'` 和 `Referrer-Policy: no-referrer`。CSP 只限于 `frame-ancestors`,因为 API 返回的是 JSON;把 API 嵌入自建前端的一方应在其渲染层施加完整的 CSP。
 
 ## 前置条件
 
@@ -83,7 +87,7 @@ home 区域与部署区域相互独立，可相同也可不同（例如：为降
 | `ALLOWED_ORIGINS` | `/api` 的 CORS 白名单（逗号分隔）。**默认关闭**：不设置则不发 CORS 头，仅同源可调。用 `*` 放行所有源。 | `https://app.example.com` |
 | `API_RATE_PER_SEC` | `/api` 每源 IP 的持续速率（令牌桶补充速率）。默认 `10`。 | `20` |
 | `API_RATE_BURST` | `/api` 每源 IP 的突发容量（令牌桶大小）。默认 `20`。 | `40` |
-| `TRUST_PROXY` | Express `trust proxy` 值——代理跳数，使限流拿到真实、不可伪造的客户端 IP。本地默认 `true`；在 CloudFront→ALB 之后设为 `2`。无法识别的值会安全退化为 `false`（并打告警）。 | `2` |
+| `TRUST_PROXY` | Express `trust proxy` 值——代理跳数，使限流拿到真实、不可伪造的客户端 IP。**默认 `false`**（安全兜底：未设置/为空或无法识别的值都不信任客户端传来的 `X-Forwarded-For`，限流无法被绕过；坏值还会打告警）。在 CloudFront→ALB 之后应设为 `2`（跳数）——ECS 栈默认已传 `TrustProxy=2`。 | `2` |
 | `REVERSE_GEO_CACHE_MAX` | 反解网格缓存的 FIFO 上限（每任务，防止无界增长的兜底）。默认 `200000`。 | `200000` |
 
 > 在用区域**和 home 区域**都**不是**环境变量——它们来自 `config/country-region-map.json`（其 key,以及被 `"*"` 标记的区域）。本地通过 `export` 设置上面这些变量；生产环境通过 CloudFormation 参数传入（见下文）。两种机制相互独立。
@@ -244,9 +248,11 @@ docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.
 docker push <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 ```
 
-**b. 部署 ECS Fargate 栈**（在部署区域）。区域集与 home 区域都来自镜像里打包的映射文件，因此只需传 `MultiRegionRouting` / secret / 域名 / 镜像：
+**b. 部署 ECS Fargate 栈**（在部署区域）。区域集与 home 区域都来自镜像里打包的映射文件，因此只需传 `MultiRegionRouting` / secret / 域名 / 镜像,外加回源校验密钥。先生成一个强随机的 `OriginVerifySecret`（它让 ALB 拒绝任何不是经由本 CloudFront 分发而来的请求）：
 
 ```bash
+ORIGIN_VERIFY_SECRET=$(openssl rand -hex 32)
+
 aws cloudformation deploy \
   --template-file infra/ecs-fargate.yaml \
   --stack-name location-proxy-ecs \
@@ -256,11 +262,13 @@ aws cloudformation deploy \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
     ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
+    OriginVerifySecret=$ORIGIN_VERIFY_SECRET \
   --region <deploy-region>
 ```
 
 - **单区域**：设 `MultiRegionRouting=false`（home 区域即你在映射里用 `"*"` 标记的那个）。
-- **可选防护参数**（均有合理默认，按需覆盖）：`AllowedOrigins=https://app.example.com`（`/api` 的 CORS 白名单，默认仅同源）、`ApiRatePerSec=10` / `ApiRateBurst=20`（`/api` 每源 IP 限流）、`TrustProxy=2`（CloudFront→ALB 跳数,用于取真实客户端 IP;默认已是 `2`）。详见[API 防护与安全说明](#api-防护与安全说明)。
+- **`OriginVerifySecret`**（必填，至少 16 字符）：CloudFront 注入为 `X-Origin-Verify` 的共享密钥;缺少它的请求 ALB 一律 403。轮换时用新值重新部署即可。
+- **可选防护参数**（均有合理默认，按需覆盖）：`AllowedOrigins=https://app.example.com`（`/api` 的 CORS 白名单，默认仅同源）、`ApiRatePerSec=10` / `ApiRateBurst=20`（`/api` 每源 IP 限流）、`TrustProxy=2`（CloudFront→ALB 跳数,用于取真实客户端 IP;默认已是 `2`）、`WebACLArn=...`（挂载边缘 WAF——见下面的可选步骤）。详见[API 防护与安全说明](#api-防护与安全说明)。
 
 > **重新部署代码/映射改动**：如果重新 build 并推送到**同一个镜像 tag**（`:latest`），`cloudformation deploy` 会因为参数没变而提示 *"No changes to deploy. Stack xxx is up to date"* ——运行中的任务仍是旧镜像。两种真正生效的方式：
 > - 强制新部署（最简单）：`aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>`（`<cluster>`/`<service>` 取自 stack 的 `ClusterName` / `ServiceName` 输出）。
@@ -275,6 +283,31 @@ aws cloudformation describe-stacks \
   --output text \
   --region <deploy-region>
 ```
+
+### 4. 可选：用 AWS WAF 做边缘限流
+
+WAF 速率规则在 CloudFront 边缘按客户端 IP 限流——是每 task 应用内限流之上的全局兜底。跳过此步则仅用应用内限流。
+
+`CLOUDFRONT` 作用域的 WebACL **只能**在 **us-east-1** 创建,因此无论你的部署区域是哪里,它都单独放在一个小栈（`infra/waf-webacl.yaml`）里。在 us-east-1 部署：
+
+```bash
+aws cloudformation deploy \
+  --template-file infra/waf-webacl.yaml \
+  --stack-name location-proxy-waf \
+  --parameter-overrides WafRateLimit=2000 \
+  --region us-east-1
+```
+
+取得 WebACL ARN 后,加上 `WebACLArn=<arn>` 重跑 ECS 部署（步骤 b）——CloudFront 是全局服务,所以尽管 ECS 栈在你的业务区域,us-east-1 的 WebACL 仍能挂到分发上：
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name location-proxy-waf \
+  --query 'Stacks[0].Outputs[?OutputKey==`WebACLArn`].OutputValue' \
+  --output text --region us-east-1
+```
+
+> `WafRateLimit` 是每个 IP 每滚动 5 分钟窗口的请求数（默认 `2000`，最小 `100`）。
 
 ## 更新国家→区域映射
 

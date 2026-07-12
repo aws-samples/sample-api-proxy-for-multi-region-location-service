@@ -29,6 +29,20 @@ test("buildApp returns an express app without throwing", () => {
   assert.strictEqual(typeof app.listen, "function");
 });
 
+test("baseline security headers are set on responses", async () => {
+  const app = buildApp(fakeDeps());
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/map-styles`);
+  await res.text();
+  server.close();
+  assert.strictEqual(res.headers.get("x-content-type-options"), "nosniff");
+  // Clickjacking defense for the served demo page (no legit framing use case).
+  assert.strictEqual(res.headers.get("x-frame-options"), "DENY");
+  assert.match(res.headers.get("content-security-policy") || "", /frame-ancestors 'none'/);
+  assert.strictEqual(res.headers.get("referrer-policy"), "no-referrer");
+});
+
 test("favicon.ico returns 204 (no console 404 noise)", async () => {
   const app = buildApp(fakeDeps());
   const server = app.listen(0);
@@ -352,6 +366,36 @@ test("a 500 returns a generic message, not the internal error detail", async () 
   assert.strictEqual(res.status, 500);
   assert.strictEqual(body.error, "Internal server error");
   assert.ok(!/403|secret-ish|eu-west-1/.test(JSON.stringify(body)), "must not leak internal detail");
+});
+
+test("fail500 log does NOT leak a key-bearing URL (some fetch errors carry ?key=... in the message)", async () => {
+  // A network-level fetch rejection can surface the request URL — which carries
+  // ?key=<apiKey> — in err.message/err.stack. fail500 logs server-side, but it
+  // must scrub any key= querystring so the secret never lands in CloudWatch.
+  const deps = fakeDeps();
+  deps.als.suggest = async () => {
+    throw new Error(
+      "request to https://places.geo.eu-west-1.amazonaws.com/v2/suggest?key=SUPERSECRETKEY failed, reason: ECONNRESET"
+    );
+  };
+  const logs = [];
+  const origErr = console.error;
+  console.error = (...args) => logs.push(args.map(String).join(" "));
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE`);
+  } finally {
+    server.close();
+    console.error = origErr;
+  }
+  const joined = logs.join("\n");
+  assert.ok(joined.length, "fail500 should still log something server-side");
+  assert.ok(/Suggest error/.test(joined), "should still name the failing context");
+  assert.ok(!/SUPERSECRETKEY/.test(joined), `log must not leak the key: ${joined}`);
+  // A key= param may only appear redacted (key=[REDACTED]), never with a value.
+  assert.ok(!/key=(?!\[REDACTED\])[^&\s]+/i.test(joined), `key value must be redacted: ${joined}`);
 });
 
 // --- lat/lng validation: malformed coords are rejected with 400 before they

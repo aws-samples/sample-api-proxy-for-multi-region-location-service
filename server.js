@@ -22,8 +22,24 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   // Behind CloudFront→ALB, req.ip must be the real (unspoofable) client for
   // per-IP rate limiting. TRUST_PROXY=2 (the CloudFront+ALB hop count) reads the
   // IP a fixed distance from the right of X-Forwarded-For so a viewer can't forge
-  // a leftmost entry to dodge the limiter. Defaults to true when not configured.
-  app.set("trust proxy", config.trustProxy ?? true);
+  // a leftmost entry to dodge the limiter. Defaults to FALSE (fail safe) when
+  // unset — production MUST set the hop count (see infra/ecs-fargate.yaml).
+  app.set("trust proxy", config.trustProxy);
+
+  // Baseline security headers on every response (no dependency needed). CSP is
+  // intentionally limited to frame-ancestors (clickjacking defense) rather than
+  // a script-src/default-src policy: the API returns JSON and the bundled page
+  // is a reference demo that uses inline scripts + a CDN, which a strict policy
+  // would break. Customers embedding the API in their own frontend apply their
+  // own full CSP at their render layer.
+  app.use((req, res, next) => {
+    res.set("X-Content-Type-Options", "nosniff");
+    res.set("X-Frame-Options", "DENY");
+    res.set("Content-Security-Policy", "frame-ancestors 'none'");
+    res.set("Referrer-Policy", "no-referrer");
+    next();
+  });
+
   app.use(express.static(path.join(__dirname, "public")));
 
   // CORS (default closed) + baseline per-IP rate limit, scoped to /api only.
@@ -39,11 +55,18 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
 
   const keyFor = (region) => config.keyMap.get(region);
 
-  // Log the full error server-side, return a generic message to the client.
+  // Log the error server-side, return a generic message to the client.
   // Internal/ALS error detail (status, region, key hints) must never leak to
   // callers — they get a 500 with a stable, non-revealing body.
+  //
+  // The log itself is scrubbed too: a network-level fetch rejection can carry
+  // the request URL — which includes ?key=<apiKey> — in err.message/err.stack.
+  // Redact any key= querystring before it reaches CloudWatch. We log the
+  // sanitized message/stack strings (not the raw Error) so nothing bypasses it.
   function fail500(res, context, err) {
-    console.error(`${context}:`, err);
+    const scrub = (s) => String(s).replace(/([?&]key=)[^&\s]+/gi, "$1[REDACTED]");
+    const detail = err && (err.stack || err.message || err);
+    console.error(`${context}: ${scrub(detail)}`);
     res.status(500).json({ error: "Internal server error" });
   }
 

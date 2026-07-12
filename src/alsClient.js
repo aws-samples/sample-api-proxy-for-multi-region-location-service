@@ -161,8 +161,22 @@ function createAlsClient({ fetchImpl = fetch, sleep = defaultSleep, maxRetries =
   function rewriteStyle(style, { region, mapTileDomain }) {
     const amazonOrigin = mapsOrigin(region);
     const cfOrigin = `https://${mapTileDomain}/${region}`;
-    const swap = (url) =>
-      url.replace(amazonOrigin, cfOrigin).replace(/[?&]key=[^&]+/g, "");
+    // Rewrite the origin, then drop the key from the QUERY STRING only. We can't
+    // feed the whole URL to `new URL()` because tile templates carry unencoded
+    // {z}/{x}/{y} placeholders in the PATH, which URL would percent-encode and
+    // break MapLibre. Parsing just the query with URLSearchParams removes `key`
+    // wherever it sits (not only when last) without leaving a dangling
+    // separator (the old /[?&]key=[^&]+/ regex turned "?key=K&foo=1" into
+    // "&foo=1"), and drops the "?" entirely when no other params remain.
+    const swap = (url) => {
+      const rewritten = url.replace(amazonOrigin, cfOrigin);
+      const q = rewritten.indexOf("?");
+      if (q === -1) return rewritten;
+      const params = new URLSearchParams(rewritten.slice(q + 1));
+      params.delete("key");
+      const qs = params.toString();
+      return qs ? `${rewritten.slice(0, q)}?${qs}` : rewritten.slice(0, q);
+    };
 
     if (style.sources) {
       for (const src of Object.values(style.sources)) {

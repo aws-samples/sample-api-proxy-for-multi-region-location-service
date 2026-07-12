@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CLOUDFRONT-scoped AWS WAF WebACL (edge rate limiting) for the Location Service Proxy
+# MUST be deployed in us-east-1: a Scope: CLOUDFRONT WebACL can only be created
+# there. This is a standalone stack so the main ECS/ALB stack
+# (infra/ecs-fargate.yaml) stays in the CUSTOMER'S BUSINESS REGION and just
+# references this WebACL's ARN via its WebACLArn parameter. CloudFront is global,
+# so a distribution created by the regional stack can attach this global WebACL.
+
+Parameters:
+  WafRateLimit:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    Description: >-
+      Rate-based rule limit: max requests per rolling 5-minute window per client
+      IP, enforced at the edge BEFORE the origin. Coarse global backstop above
+      the per-task in-app limiter (which is per-task and only protects ALS
+      spend). Requests blocked here never reach ALB/ECS/ALS, so they cost
+      ~nothing and don't burn ALS quota.
+
+Resources:
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-webacl"
+      Rules:
+        - Name: RateLimitPerIP
+          Priority: 0
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafRateLimit
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-ratelimit"
+
+Outputs:
+  WebACLArn:
+    Description: Pass this as the WebACLArn parameter of the ecs-fargate stack
+    Value: !GetAtt WebACL.Arn

@@ -57,6 +57,11 @@ test("home region defaults to regions[0] when not specified", () => {
   assert.match(defaultBlock, /TargetOriginId: EuWest1Origin/);
 });
 
+test("distribution enables HTTP/2 and HTTP/3 for viewers (default is http1.1)", () => {
+  const tpl = buildTemplate(["eu-west-1"], "s");
+  assert.match(tpl, /HttpVersion: http2and3/);
+});
+
 test("policy suffix makes account-global policy names unique", () => {
   const tpl = buildTemplate(["eu-west-1"], "s", "ab12cd");
   assert.match(tpl, /Name: !Sub "\$\{AWS::StackName\}-MapTileCache-ab12cd"/);

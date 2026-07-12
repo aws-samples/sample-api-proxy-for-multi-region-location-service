@@ -105,6 +105,29 @@ test("rewriteStyle replaces region origin with CloudFront region-prefixed path a
   assert.deepStrictEqual(out.layers[0].paint, { y: 1 });
 });
 
+test("rewriteStyle strips key even when it is NOT the last query param (no leftover key, well-formed URL)", () => {
+  const als = createAlsClient({ fetchImpl: async () => ({}) });
+  const style = {
+    // key in the middle: naive /[?&]key=[^&]+/ removal can leave a dangling
+    // "?&" or drop the wrong separator — worse, a malformed strip could leak
+    // the key. Rebuild via URL so the key is gone and the URL stays valid.
+    sources: {
+      m: { tiles: ["https://maps.geo.eu-west-1.amazonaws.com/v2/tiles/{z}/{x}/{y}?key=SECRET&foo=bar"] },
+      v: { url: "https://maps.geo.eu-west-1.amazonaws.com/v2/vector?a=1&key=SECRET&b=2" },
+    },
+  };
+  const out = als.rewriteStyle(style, { region: "eu-west-1", mapTileDomain: "d1.cloudfront.net" });
+  const tile = out.sources.m.tiles[0];
+  const url = out.sources.v.url;
+  assert.ok(!/SECRET/.test(tile), `key must be gone from tiles: ${tile}`);
+  assert.ok(!/key=/.test(tile), `no key= param may remain in tiles: ${tile}`);
+  assert.ok(!/SECRET/.test(url), `key must be gone from url: ${url}`);
+  assert.ok(!/key=/.test(url), `no key= param may remain in url: ${url}`);
+  // The non-key params must survive and the origin must be rewritten to CF.
+  assert.match(tile, /^https:\/\/d1\.cloudfront\.net\/eu-west-1\/v2\/tiles\/\{z\}\/\{x\}\/\{y\}\?foo=bar$/);
+  assert.match(url, /^https:\/\/d1\.cloudfront\.net\/eu-west-1\/v2\/vector\?a=1&b=2$/);
+});
+
 test("getPlace hits the region's place endpoint with placeId and default language en", async () => {
   const captured = {};
   const als = createAlsClient({ fetchImpl: fakeFetch(captured, { Title: "x" }) });

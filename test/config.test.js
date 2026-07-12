@@ -135,7 +135,7 @@ test("loadConfig reads REVERSE_GEO_CACHE_MAX override", () => {
   assert.strictEqual(cfg.reverseGeoCacheMax, 50000);
 });
 
-test("loadConfig trustProxy: numeric hop count, boolean, or default true", () => {
+test("loadConfig trustProxy: numeric hop count, boolean, or default false (fail safe)", () => {
   const mk = (env) =>
     loadConfig(
       { LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d", ...env },
@@ -147,8 +147,12 @@ test("loadConfig trustProxy: numeric hop count, boolean, or default true", () =>
   assert.strictEqual(mk({ TRUST_PROXY: "false" }).trustProxy, false);
   // "true" → boolean true.
   assert.strictEqual(mk({ TRUST_PROXY: "true" }).trustProxy, true);
-  // unset → default true (works out of the box locally).
-  assert.strictEqual(mk({}).trustProxy, true);
+  // unset → default FALSE (fail safe): behind a proxy without TRUST_PROXY set,
+  // req.ip must NOT trust a client-supplied X-Forwarded-For, or the rate
+  // limiter's client IP becomes spoofable. Production pins the hop count (=2).
+  assert.strictEqual(mk({}).trustProxy, false);
+  // empty string → same safe default as unset.
+  assert.strictEqual(mk({ TRUST_PROXY: "" }).trustProxy, false);
 });
 
 test("loadConfig trustProxy: an UNRECOGNIZED value degrades to false (fail safe), not true", () => {

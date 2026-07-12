@@ -54,9 +54,13 @@ Browser
 
 **CORS (`/api`)** — Default closed: with `ALLOWED_ORIGINS` unset, no CORS headers are sent, so only same-origin callers work. Because the proxy is the deliverable and a customer may host their own frontend on a different origin, set `ALLOWED_ORIGINS` to opt those origins in. Avoid `*` in production — it lets any website call your API and burn the account's ALS quota. The API carries no cookies/credentials (keys stay server-side), so this is about *who may call*, not CSRF.
 
-**Rate limiting (`/api`)** — A baseline per-source-IP token bucket (`API_RATE_PER_SEC` sustained + `API_RATE_BURST` spike) throttles abuse; `/health` is exempt so the ALB health check is never throttled. This is a **floor, not a WAF replacement**: it is per-task (in-memory), so with N ECS tasks the effective global rate is up to N × `API_RATE_PER_SEC`. For true global limiting, layer a WAF rate-based rule (or a shared store like ElastiCache) on top. `TRUST_PROXY=2` (the CloudFront→ALB hop count) ensures the limiter keys on the real, unspoofable client IP rather than the ALB's.
+**Rate limiting (`/api`)** — A baseline per-source-IP token bucket (`API_RATE_PER_SEC` sustained + `API_RATE_BURST` spike) throttles abuse; `/health` is exempt so the ALB health check is never throttled. It is a **floor, not a WAF replacement**: per-task (in-memory), so with N ECS tasks the global rate is up to N × `API_RATE_PER_SEC`. For a global cap at the CloudFront edge, attach the optional WAF rule ([step 4](#4-optional-edge-rate-limiting-with-aws-waf)). `TRUST_PROXY=2` (the CloudFront→ALB hop count) keys the limiter on the real, unspoofable client IP, not the ALB's.
 
-**CloudFront → ALB origin traffic (plaintext)** — In the ECS stack, viewer-facing HTTPS is terminated at CloudFront; the CloudFront→ALB hop is HTTP. The ALB is internet-facing but its **security group** only admits the [CloudFront managed prefix list](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html), so it isn't directly reachable from the public internet. Origin-fetch traffic from CloudFront to an AWS origin travels over the **AWS network backbone**, not the public internet (AWS even waives data-transfer charges for it) — so the residual exposure is plaintext *query terms/coordinates* on AWS-operated infrastructure, never credentials (the ALS key never traverses this hop). We judge this acceptable and leave it plaintext by default. To eliminate even that, add HTTPS-to-origin: put an ACM certificate on a custom ALB domain and point CloudFront's origin at it (an ALB's default `*.elb.amazonaws.com` name can't hold an ACM cert, so a domain you own is required).
+**CloudFront → ALB origin protection** — The ALB is internet-facing, but two controls keep it reachable only through *this* distribution: its **security group** admits only the [CloudFront managed prefix list](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html), and its listener **returns 403 unless the request carries the `X-Origin-Verify` shared-secret header** this distribution injects (`OriginVerifySecret`). Because the prefix list spans *all* CloudFront distributions, the header is what stops someone pointing their own distribution at your ALB's DNS. (Health checks hit the target directly, so they're unaffected.)
+
+**CloudFront → ALB origin traffic (plaintext)** — Viewer HTTPS terminates at CloudFront; the CloudFront→ALB hop is HTTP but travels the **AWS backbone**, not the public internet. So the residual exposure is plaintext query terms/coordinates on AWS infrastructure — never credentials (neither the ALS key nor the `X-Origin-Verify` secret leaves the backbone). We leave it plaintext by default; to encrypt it, put an ACM cert on a custom ALB domain and point CloudFront's origin at it (the default `*.elb.amazonaws.com` name can't hold an ACM cert).
+
+**Security response headers** — Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, and `Referrer-Policy: no-referrer`. The CSP is limited to `frame-ancestors` because the API returns JSON; a frontend embedding it applies its own full CSP.
 
 ## Prerequisites
 
@@ -83,7 +87,7 @@ The home region and the deploy region are independent: they can be the same or d
 | `ALLOWED_ORIGINS` | CORS allowlist for `/api` (comma-separated). **Default closed**: unset ⇒ no CORS headers ⇒ same-origin only. Use `*` to allow any origin. | `https://app.example.com` |
 | `API_RATE_PER_SEC` | Sustained per-source-IP request rate for `/api` (token-bucket refill). Default `10`. | `20` |
 | `API_RATE_BURST` | Per-source-IP burst capacity for `/api` (bucket size). Default `20`. | `40` |
-| `TRUST_PROXY` | Express `trust proxy` value — the proxy hop count so the rate limiter sees the real, unspoofable client IP. Default `true` locally; set to `2` behind CloudFront→ALB. An unrecognized value fails safe to `false` (with a warning). | `2` |
+| `TRUST_PROXY` | Express `trust proxy` value — the proxy hop count so the rate limiter sees the real, unspoofable client IP. **Defaults to `false`** (fail-safe: an unset/empty or unrecognized value won't trust a client-supplied `X-Forwarded-For`, so the limiter can't be dodged; a bad value also warns). Behind CloudFront→ALB set it to `2` (the hop count) — the ECS stack passes `TrustProxy=2` by default. | `2` |
 | `REVERSE_GEO_CACHE_MAX` | FIFO cap for the per-task reverse-geocode grid cache (backstop against unbounded growth). Default `200000`. | `200000` |
 
 > The regions in use **and the home region** are **not** environment variables — they come from `config/country-region-map.json` (its keys, and the `"*"`-marked region). Locally the variables above are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
@@ -244,9 +248,11 @@ docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.
 docker push <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 ```
 
-**b. Deploy the ECS Fargate stack** (in your deploy region). The regions and the home region both come from the mapping file baked into the image, so only `MultiRegionRouting` / the secret / domain / image are passed:
+**b. Deploy the ECS Fargate stack** (in your deploy region). The regions and the home region both come from the mapping file baked into the image, so only `MultiRegionRouting` / the secret / domain / image plus the origin-verify secret are passed. Generate a strong `OriginVerifySecret` first (it lets the ALB reject any request that didn't come through this CloudFront distribution):
 
 ```bash
+ORIGIN_VERIFY_SECRET=$(openssl rand -hex 32)
+
 aws cloudformation deploy \
   --template-file infra/ecs-fargate.yaml \
   --stack-name location-proxy-ecs \
@@ -256,11 +262,13 @@ aws cloudformation deploy \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
     ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
+    OriginVerifySecret=$ORIGIN_VERIFY_SECRET \
   --region <deploy-region>
 ```
 
 - **Single-region**: set `MultiRegionRouting=false` (the home region is whatever you marked `"*"` in the mapping).
-- **Optional protection params** (sensible defaults, override as needed): `AllowedOrigins=https://app.example.com` (CORS allowlist for `/api`, default same-origin only), `ApiRatePerSec=10` / `ApiRateBurst=20` (per-source-IP `/api` rate limit), `TrustProxy=2` (CloudFront→ALB hop count for the real client IP; default already `2`). See [API protection & security notes](#api-protection--security-notes).
+- **`OriginVerifySecret`** (required, min 16 chars): the shared secret CloudFront injects as `X-Origin-Verify`; the ALB 403s any request lacking it. Rotate by redeploying with a new value.
+- **Optional protection params** (sensible defaults, override as needed): `AllowedOrigins=https://app.example.com` (CORS allowlist for `/api`, default same-origin only), `ApiRatePerSec=10` / `ApiRateBurst=20` (per-source-IP `/api` rate limit), `TrustProxy=2` (CloudFront→ALB hop count for the real client IP; default already `2`), `WebACLArn=...` (attach an edge WAF — see the optional step below). See [API protection & security notes](#api-protection--security-notes).
 
 > **Redeploying code/mapping changes**: if you rebuild and push to the **same image tag** (`:latest`), `cloudformation deploy` sees no parameter change and reports *"No changes to deploy. Stack xxx is up to date"* — the running tasks keep the old image. Two ways to actually roll out:
 > - Force a new deployment (simplest): `aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>` (get `<cluster>`/`<service>` from the stack's `ClusterName` / `ServiceName` outputs).
@@ -275,6 +283,31 @@ aws cloudformation describe-stacks \
   --output text \
   --region <deploy-region>
 ```
+
+### 4. Optional: edge rate limiting with AWS WAF
+
+A WAF rate-based rule caps requests per client IP at the CloudFront edge — a global backstop above the per-task in-app limiter. Skip this step to run with the in-app limiter only.
+
+A `CLOUDFRONT`-scoped WebACL can **only** be created in **us-east-1**, so it lives in its own small stack (`infra/waf-webacl.yaml`) regardless of your deploy region. Deploy it there:
+
+```bash
+aws cloudformation deploy \
+  --template-file infra/waf-webacl.yaml \
+  --stack-name location-proxy-waf \
+  --parameter-overrides WafRateLimit=2000 \
+  --region us-east-1
+```
+
+Get the WebACL ARN and re-run the ECS deploy (step b) with `WebACLArn=<arn>` added — CloudFront is global, so a us-east-1 WebACL attaches to the distribution even though the ECS stack is in your business region:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name location-proxy-waf \
+  --query 'Stacks[0].Outputs[?OutputKey==`WebACLArn`].OutputValue' \
+  --output text --region us-east-1
+```
+
+> `WafRateLimit` is requests per rolling 5-minute window per IP (default `2000`, min `100`).
 
 ## Updating the country→region mapping
 

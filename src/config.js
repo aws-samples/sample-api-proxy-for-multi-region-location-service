@@ -43,12 +43,15 @@ function validateConfig(cfg) {
 }
 
 // Parse TRUST_PROXY into what Express `set('trust proxy', …)` accepts: a hop
-// count (number), a boolean, or the default (true) when unset. An UNRECOGNIZED
-// value (e.g. a typo like "tw") fails SAFE to `false` + a warning: `true` would
-// silently trust every proxy hop and make the rate-limiter's client IP
-// spoofable, whereas `false` only makes limiting stricter (uses the ALB IP).
+// count (number), a boolean, or the default (FALSE) when unset. Every unhandled
+// case fails SAFE to `false`: unset/empty and an UNRECOGNIZED value (e.g. a typo
+// like "tw") both default to `false` + a warning. `true` would trust the whole
+// X-Forwarded-For chain and make the rate-limiter's client IP spoofable (a
+// viewer forges a leftmost entry to dodge the limiter); `false` only makes
+// limiting stricter (keys on the ALB IP). Production MUST set the exact hop
+// count (CloudFront→ALB = 2) so req.ip is the real, unspoofable client.
 function parseTrustProxy(value) {
-  if (value === undefined || value === "") return true;
+  if (value === undefined || value === "") return false;
   if (value === "true") return true;
   if (value === "false") return false;
   const n = Number(value);

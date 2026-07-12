@@ -1,5 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: ECS Fargate + ALB deployment for Location Service Proxy
+# Deploy this stack in the CUSTOMER'S BUSINESS REGION (near their users / ALS
+# regions). Edge rate limiting is provided by an AWS WAF WebACL that — being
+# CLOUDFRONT-scoped — must live in us-east-1; it is therefore created by a
+# SEPARATE us-east-1 stack (infra/waf-webacl.yaml) and its ARN is passed in via
+# the optional WebACLArn parameter. A CloudFront distribution is global, so this
+# regional stack can attach a us-east-1 WebACL ARN without itself being in
+# us-east-1.
 
 # CloudFront managed prefix list IDs per region
 # Source: https://docs.aws.amazon.com/vpc/latest/userguide/working-with-aws-managed-prefix-lists.html
@@ -81,6 +88,31 @@ Parameters:
     Type: Number
     Default: 2
     MinValue: 2
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >-
+      Shared secret CloudFront injects as the X-Origin-Verify header. The ALB
+      returns 403 to any request that lacks it, so the internet-facing ALB
+      cannot be reached by pointing another CloudFront distribution (or direct
+      client) at its DNS — traffic must flow through THIS distribution. Supply a
+      long random value (e.g. `openssl rand -hex 32`); rotate by updating the
+      stack. Health checks are unaffected (they hit the target directly, not via
+      the listener rule).
+  WebACLArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. ARN of a CLOUDFRONT-scoped AWS WAF WebACL (created in us-east-1
+      by infra/waf-webacl.yaml) to attach to the distribution for edge rate
+      limiting. Leave empty to deploy without an edge WebACL. CloudFront is
+      global, so a us-east-1 WebACL ARN attaches fine even though this stack runs
+      in the business region.
+
+Conditions:
+  # Attach the edge WebACL only when an ARN is supplied.
+  HasWebACL: !Not [!Equals [!Ref WebACLArn, ""]]
 
 Resources:
   # ---- VPC ----
@@ -187,6 +219,11 @@ Resources:
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
 
+  # Default DENY: anything reaching the ALB without the shared secret header
+  # (e.g. another CloudFront distribution pointed at this ALB's DNS, or a direct
+  # client inside the CloudFront prefix list) gets a 403. Only ForwardRule below
+  # — matched on the X-Origin-Verify header CloudFront injects — forwards to the
+  # app. (Target-group health checks hit targets directly, bypassing this rule.)
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -194,12 +231,37 @@ Resources:
       Port: 80
       Protocol: HTTP
       DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: text/plain
+            MessageBody: "Forbidden"
+
+  ForwardRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginVerifySecret
+      Actions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
   # ---- ECS ----
   ECSCluster:
     Type: AWS::ECS::Cluster
+    Properties:
+      # CloudWatch Container Insights — off by default, so ECS CPU/memory/task
+      # metrics wouldn't otherwise appear. Use "enhanced" for per-task/container
+      # metrics (extra cost); "enabled" is the standard cluster-level set.
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
 
   LogGroup:
     Type: AWS::Logs::LogGroup
@@ -337,11 +399,23 @@ Resources:
         Enabled: true
         Comment: !Sub "${AWS::StackName} - CDN for ALB"
         PriceClass: PriceClass_All
+        # Serve viewers over HTTP/2 and HTTP/3 (default is http1.1). Falls back
+        # to older versions for viewers that don't support them.
+        HttpVersion: http2and3
+        # Optional edge WAF: pass the ARN of the us-east-1 CLOUDFRONT WebACL
+        # from infra/waf-webacl.yaml. Empty (default) → no WebACL attached (the
+        # in-app per-task limiter + origin-verify header still apply).
+        WebACLId: !If [HasWebACL, !Ref WebACLArn, !Ref "AWS::NoValue"]
         Origins:
           - Id: ALBOrigin
             DomainName: !GetAtt ALB.DNSName
             CustomOriginConfig:
               OriginProtocolPolicy: http-only
+            # Shared secret proving a request came through THIS distribution.
+            # The ALB's ForwardRule requires it; without it the ALB returns 403.
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginVerifySecret
         DefaultCacheBehavior:
           TargetOriginId: ALBOrigin
           ViewerProtocolPolicy: redirect-to-https
@@ -393,8 +467,14 @@ Outputs:
     Description: Application URL (CloudFront)
     Value: !Sub https://${CDN.DomainName}
   ALBUrl:
-    Description: ALB URL (internal, do not expose)
+    Description: >-
+      ALB URL (internal — returns 403 unless the X-Origin-Verify header is
+      present; only THIS CloudFront distribution injects it). Do not expose.
     Value: !Sub http://${ALB.DNSName}
+  AttachedWebACLArn:
+    Condition: HasWebACL
+    Description: WAF WebACL attached to the distribution (edge rate limiting)
+    Value: !Ref WebACLArn
   CloudFrontDistributionId:
     Value: !Ref CDN
   ClusterName:
