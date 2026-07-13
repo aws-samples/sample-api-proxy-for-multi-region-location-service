@@ -25,7 +25,12 @@ async function ensureOk(resp, op, region) {
     /* body may be unreadable; the status is enough */
   }
   console.error(`[als] ${op} failed: HTTP ${resp.status} in ${region} ${detail}`);
-  throw new Error(`ALS ${op} failed: HTTP ${resp.status} in ${region}`);
+  const err = new Error(`ALS ${op} failed: HTTP ${resp.status} in ${region}`);
+  // Carry the upstream status so the caller can distinguish a client-caused 4xx
+  // (bad input → surface as 4xx) from a server-side 5xx / 403 (→ 500). 403 is a
+  // bad/expired key, which is the deployment's fault, not the caller's.
+  err.status = resp.status;
+  throw err;
 }
 
 // Transient failures worth retrying: throttling (429) and server errors (5xx).

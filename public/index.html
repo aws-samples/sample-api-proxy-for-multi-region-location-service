@@ -237,6 +237,17 @@
       try {
         const res = await fetch(`/api/suggest?${params}`);
         const items = await res.json();
+        // Unsupported countryCode (e.g. "UK", whose ISO code is "GB", or any
+        // code not in the mapping) → backend returns 400. Drop the offending
+        // code from the country box and retry globally (HOME fallback) so a
+        // typo doesn't leave the user stuck with an error.
+        if (res.status === 400 && items && /countryCode|country/i.test(items.error || "")) {
+          const box = document.getElementById("country-input");
+          if (box.value) {
+            box.value = "";
+            return fetchSuggestions(query); // retry once, now without the bad code
+          }
+        }
         // Guard against a non-array (e.g. an error object) so a bad response
         // can never throw here and freeze the input handler.
         if (!Array.isArray(items)) throw new Error(items && items.error ? items.error : "bad response");

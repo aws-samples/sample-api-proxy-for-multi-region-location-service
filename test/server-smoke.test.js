@@ -398,6 +398,91 @@ test("fail500 log does NOT leak a key-bearing URL (some fetch errors carry ?key=
   assert.ok(!/key=(?!\[REDACTED\])[^&\s]+/i.test(joined), `key value must be redacted: ${joined}`);
 });
 
+// --- countryCode validation: an unsupported/invalid code must be rejected at
+// the boundary with 400, never forwarded to ALS as a hard IncludeCountries
+// filter (ALS 400s on a non-ISO code like "UK"). The mapping is the single
+// source of truth for which countries are served. ---
+
+test("suggest rejects an unsupported countryCode with 400 (never reaches ALS)", async () => {
+  const deps = fakeDeps(); // mapping serves only DE (→ eu-west-1)
+  let called = false;
+  deps.als.suggest = async () => { called = true; return { ResultItems: [] }; };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  // "UK" is not a valid ISO code (the UK is "GB") and is not in the mapping.
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=london&countryCode=UK`);
+  const body = await res.json();
+  server.close();
+  assert.strictEqual(res.status, 400, "unsupported country must be a client error, not 500");
+  assert.match(body.error || "", /countryCode|country/i);
+  assert.ok(/UK/.test(body.error || ""), "error should name the offending code");
+  assert.strictEqual(called, false, "als.suggest must NOT be called with an unsupported country");
+});
+
+test("suggest accepts a supported countryCode (case-insensitive) and calls ALS", async () => {
+  const deps = fakeDeps();
+  let seen;
+  deps.als.suggest = async (args) => { seen = args; return { ResultItems: [] }; };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=de`);
+  server.close();
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(seen.region, "eu-west-1"); // DE → eu-west-1
+  assert.deepStrictEqual(seen.includeCountries, ["DE"]); // normalized upper-case
+});
+
+test("place rejects an unsupported countryCode with 400", async () => {
+  const deps = fakeDeps();
+  let called = false;
+  deps.als.getPlace = async () => { called = true; return {}; };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  // No ?region (which would bypass resolution) → countryCode is used → must validate.
+  const res = await fetch(`http://127.0.0.1:${port}/api/place/PID?countryCode=UK`);
+  server.close();
+  assert.strictEqual(res.status, 400);
+  assert.strictEqual(called, false);
+});
+
+// --- ALS client errors (4xx) are the caller's fault (bad input) → surface as
+// 4xx, not 500. 403/5xx/network remain 500 (server-side / bad key / transient). ---
+
+test("an ALS 4xx surfaces as a client 400, not a 500", async () => {
+  const deps = fakeDeps();
+  deps.als.suggest = async () => {
+    const e = new Error("ALS suggest failed: HTTP 400 in eu-west-1");
+    e.status = 400;
+    throw e;
+  };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE`);
+  const body = await res.json();
+  server.close();
+  assert.strictEqual(res.status, 400, "an ALS 400 must not be reported as a 500");
+  assert.ok(!/eu-west-1|HTTP 400/.test(JSON.stringify(body)), "must not leak internal detail");
+});
+
+test("a non-4xx ALS failure (e.g. 403 bad key) still surfaces as 500", async () => {
+  const deps = fakeDeps();
+  deps.als.suggest = async () => {
+    const e = new Error("ALS suggest failed: HTTP 403 in eu-west-1");
+    e.status = 403;
+    throw e;
+  };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE`);
+  server.close();
+  assert.strictEqual(res.status, 500, "a 403 (server-side bad key) stays a 500");
+});
+
 // --- lat/lng validation: malformed coords are rejected with 400 before they
 // can reach ALS as NaN. ---
 

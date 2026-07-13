@@ -70,6 +70,35 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     res.status(500).json({ error: "Internal server error" });
   }
 
+  // Map an ALS failure to the right client status. A 4xx from ALS other than
+  // 403 means the REQUEST was bad (e.g. an invalid Filter value) → surface 4xx
+  // so it isn't mistaken for a server/region outage. 403 (bad/expired key) and
+  // 5xx/network are the deployment's problem → 500. Either way the body stays
+  // generic and the detail is logged (scrubbed) by fail500.
+  function failAls(res, context, err) {
+    const status = err && err.status;
+    if (typeof status === "number" && status >= 400 && status < 500 && status !== 403) {
+      const scrub = (s) => String(s).replace(/([?&]key=)[^&\s]+/gi, "$1[REDACTED]");
+      console.error(`${context}: ${scrub(err.stack || err.message || err)}`);
+      return res.status(400).json({ error: "Invalid request" });
+    }
+    return fail500(res, context, err);
+  }
+
+  // Validate an optional countryCode against the mapping (the single source of
+  // truth for served countries). Returns the normalized upper-case code, null
+  // when absent, or { error } when the code is present but unsupported — the
+  // caller returns 400 so a bad/unknown code (e.g. "UK", whose ISO code is "GB")
+  // never reaches ALS as a hard IncludeCountries filter (ALS 400s on it).
+  function normalizeCountry(countryCode) {
+    if (!countryCode) return { code: null };
+    const cc = String(countryCode).toUpperCase();
+    if (!mappingStore.getRegion(cc)) {
+      return { error: `Unsupported countryCode "${cc}" (not a served country in the mapping)` };
+    }
+    return { code: cc };
+  }
+
   // Resolve target region for a request from countryCode or lat/lng.
   async function targetRegionFor({ countryCode, lat, lng }) {
     const result = await resolveRegion(
@@ -97,8 +126,10 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     if (!query) return res.json([]);
     const coords = parseCoords(lat, lng);
     if (!coords.valid) return res.status(400).json({ error: coords.error });
+    const country = normalizeCountry(countryCode);
+    if (country.error) return res.status(400).json({ error: country.error });
     try {
-      const region = await targetRegionFor({ countryCode, lat: coords.lat, lng: coords.lng });
+      const region = await targetRegionFor({ countryCode: country.code, lat: coords.lat, lng: coords.lng });
       // Bias selection (BiasPosition is required by ALS suggest). Priority
       // matches the routing contract:
       //   - explicit countryCode -> bias to that region's center (country is
@@ -107,12 +138,13 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       //   - else -> region (HOME) center (always inside coverage; a bias
       //     outside a region's coverage, esp. GrabMaps, can return nothing).
       const [biasLng, biasLat] =
-        !countryCode && coords.lat != null
+        !country.code && coords.lat != null
           ? [coords.lng, coords.lat]
           : regionCenter(region).center;
       // countryCode also becomes a hard IncludeCountries filter, so results are
-      // constrained to that country regardless of bias ranking.
-      const includeCountries = countryCode ? [String(countryCode).toUpperCase()] : undefined;
+      // constrained to that country regardless of bias ranking. Validated above
+      // against the mapping, so it is always a served (ISO-valid) code here.
+      const includeCountries = country.code ? [country.code] : undefined;
       const data = await als.suggest({
         region,
         key: keyFor(region),
@@ -137,7 +169,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
         }));
       res.json(suggestions);
     } catch (err) {
-      fail500(res, "Suggest error", err);
+      failAls(res, "Suggest error", err);
     }
   });
 
@@ -145,6 +177,8 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     const { countryCode, lat, lng, region: regionParam, lang } = req.query;
     const coords = parseCoords(lat, lng);
     if (!coords.valid) return res.status(400).json({ error: coords.error });
+    const reqCountry = normalizeCountry(countryCode);
+    if (reqCountry.error) return res.status(400).json({ error: reqCountry.error });
     try {
       // A PlaceId is region-scoped: GetPlace must run in the region that
       // produced it. The frontend passes ?region=<suggest's region> so we use
@@ -152,7 +186,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       const region =
         regionParam && config.enabledRegions.has(regionParam)
           ? regionParam
-          : await targetRegionFor({ countryCode, lat: coords.lat, lng: coords.lng });
+          : await targetRegionFor({ countryCode: reqCountry.code, lat: coords.lat, lng: coords.lng });
       const data = await als.getPlace({ region, key: keyFor(region), placeId: req.params.placeId, lang });
       // tileRegion = the region whose map data covers the RESULT's country
       // (not necessarily the region that produced the PlaceId). The frontend
@@ -161,7 +195,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       const tileRegion = (country && mappingStore.getRegion(country)) || config.homeRegion;
       res.json({ label: data.Title, position: data.Position, address: data.Address, tileRegion, country });
     } catch (err) {
-      fail500(res, "GetPlace error", err);
+      failAls(res, "GetPlace error", err);
     }
   });
 
@@ -192,17 +226,19 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     }
     const coords = parseCoords(lat, lng);
     if (!coords.valid) return res.status(400).json({ error: coords.error });
+    const country = normalizeCountry(countryCode);
+    if (country.error) return res.status(400).json({ error: country.error });
     try {
       // Explicit ?region lets the frontend switch map tiles to a selected
       // result's region (e.g. a Singapore result -> GrabMaps tiles).
       const region =
         regionParam && config.enabledRegions.has(regionParam)
           ? regionParam
-          : await targetRegionFor({ countryCode, lat: coords.lat, lng: coords.lng });
+          : await targetRegionFor({ countryCode: country.code, lat: coords.lat, lng: coords.lng });
       const style = await als.getStyleDescriptor({ region, key: keyFor(region), styleName });
       res.json(als.rewriteStyle(style, { region, mapTileDomain: config.mapTileDomain }));
     } catch (err) {
-      fail500(res, "Map style error", err);
+      failAls(res, "Map style error", err);
     }
   });
 
