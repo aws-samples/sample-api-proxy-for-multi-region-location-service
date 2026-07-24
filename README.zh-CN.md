@@ -318,3 +318,15 @@ aws cloudformation describe-stacks \
 ```bash
 npm test
 ```
+
+## 安全
+
+更多信息请参阅 [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications)。
+
+## 许可
+
+本项目基于 MIT-0 许可证授权。详见 LICENSE 文件。
+
+---
+
+⭐ 如果这个项目对你有帮助，欢迎[给仓库点个 star](https://github.com/aws-samples/sample-api-proxy-for-multi-region-location-service) —— 这能帮助更多人发现它。

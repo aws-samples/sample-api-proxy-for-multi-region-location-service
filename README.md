@@ -318,3 +318,15 @@ Edit `config/country-region-map.json`, then rebuild and push the image. Roll it 
 ```bash
 npm test
 ```
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
+
+---
+
+⭐ If this project is useful to you, please consider [starring the repo](https://github.com/aws-samples/sample-api-proxy-for-multi-region-location-service) — it helps others discover it.
