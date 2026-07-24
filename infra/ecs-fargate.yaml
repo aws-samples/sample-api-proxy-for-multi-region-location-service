@@ -184,17 +184,45 @@ Resources:
           FromPort: 80
           ToPort: 80
           SourcePrefixListId: !FindInMap [CloudFrontPrefixList, !Ref AWS::Region, PrefixListId]
+          Description: HTTP from the CloudFront managed prefix list only
+      # Explicit egress (not the implicit allow-all): the ALB only needs to reach
+      # the ECS tasks on the app port. Locking this down clears cfn_nag F1000.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          DestinationSecurityGroupId: !Ref ECSSecurityGroup
+          Description: Forward to ECS tasks on the app port
 
   ECSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: ECS tasks - allow traffic from ALB only
       VpcId: !Ref VPC
-      SecurityGroupIngress:
+      # Ingress from the ALB is a SEPARATE resource (ECSFromALBIngress below), not
+      # inline here: ALBSecurityGroup's egress references this group, so an inline
+      # rule referencing ALBSecurityGroup back would be a circular dependency.
+      # Explicit egress (not the implicit allow-all): the task calls the Amazon
+      # Location Service API over HTTPS and pulls container images/secrets, all
+      # over 443. Making this explicit clears cfn_nag F1000.
+      SecurityGroupEgress:
         - IpProtocol: tcp
-          FromPort: 3000
-          ToPort: 3000
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS out to Amazon Location Service, ECR, and Secrets Manager
+
+  # Standalone ingress rule (breaks the ALB<->ECS circular reference): the ALB SG
+  # references ECS in its egress, so ECS's "allow from ALB" ingress lives here.
+  ECSFromALBIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: App traffic from the ALB security group only
 
   # ---- ALB ----
   ALB:
