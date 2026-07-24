@@ -2,6 +2,7 @@
   "name": "location-service-proxy",
   "version": "1.0.0",
   "description": "Amazon Location Service - Server-side Proxy for Address Autocomplete & Maps",
+  "license": "MIT-0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
