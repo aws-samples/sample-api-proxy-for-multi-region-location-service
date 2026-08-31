@@ -3,6 +3,19 @@ const assert = require("node:assert");
 const express = require("express");
 const { loadConfig } = require("../src/config");
 
+// Fully tear down a test server. `close()` stops the listener but leaves already
+// established keep-alive sockets open. Node's fetch pools those sockets per
+// origin (127.0.0.1:PORT), so once the OS hands the same port to a later test's
+// server, a stale pooled socket delivers bytes to the WRONG server — Node then
+// answers at the protocol level (400 Bad Request / 426 Upgrade Required) without
+// ever entering Express, which is exactly how this suite used to flake. Destroying
+// the connections keeps every server strictly inside the test that created it.
+function shutdown(srv) {
+  if (typeof srv.closeAllConnections === "function") srv.closeAllConnections();
+  srv.close();
+}
+
+
 // Verifies the actual runtime behavior our rate limiter depends on: with
 // TRUST_PROXY=2 (the CloudFront→ALB hop count), Express resolves req.ip to the
 // REAL client IP — not the ALB (socket peer), not the CloudFront edge, and not
@@ -41,7 +54,7 @@ async function whoami(trustProxyEnv, xff) {
     });
     return res.json();
   } finally {
-    server.close();
+    shutdown(server);
   }
 }
 

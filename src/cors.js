@@ -1,15 +1,15 @@
-// CORS for the /api surface. The proxy is the deliverable, and a customer may
-// host their own frontend on a DIFFERENT origin — without CORS the browser
-// blocks those cross-origin calls. This is DEFAULT-CLOSED: with no allowlist
-// configured, no CORS headers are sent (same-origin only), so the API is never
-// accidentally opened to the whole web (which would let any site burn the
-// account's ALS quota). Set ALLOWED_ORIGINS to opt specific origins in.
+// CORS response policy for the /api surface. With no allowlist configured,
+// cross-origin browser JavaScript cannot read responses; set ALLOWED_ORIGINS to
+// expose them to specific frontend origins. This is not authentication or a
+// quota boundary: non-browser clients can omit/spoof Origin, and a disallowed
+// simple request may still reach the server even though the browser hides its
+// response. Use rate limiting, WAF, and origin protection for abuse controls.
 //
-// The API carries no cookies/credentials (keys live server-side), so this is
-// about controlling WHO may call the API, not CSRF.
+// The API carries no cookies/credentials (keys live server-side), so CSRF is not
+// the concern here.
 
 // Parse the ALLOWED_ORIGINS env (comma-separated) into a trimmed list.
-// Empty/undefined → [] (same-origin only).
+// Empty/undefined → [] (no cross-origin response headers).
 function parseAllowedOrigins(value) {
   if (!value) return [];
   return value

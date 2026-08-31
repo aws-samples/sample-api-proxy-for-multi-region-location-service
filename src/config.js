@@ -1,6 +1,8 @@
 const { ALS_SUPPORTED_REGIONS, GRABMAPS_REGIONS } = require("../config/als-regions");
 const { parseKeyMap } = require("./keyMap");
 const { parseAllowedOrigins } = require("./cors");
+const { normalizeLanguage } = require("./mapLanguage");
+const { DEFAULT_MAP_LANGUAGE } = require("../config/map-languages");
 
 // Pure validation of an already-parsed config object. Throws on any problem.
 // Both `homeRegion` and `enabledRegions` come from the mapping file (its "*"
@@ -55,12 +57,37 @@ function parseTrustProxy(value) {
   if (value === "true") return true;
   if (value === "false") return false;
   const n = Number(value);
-  if (Number.isFinite(n)) return n;
+  if (Number.isInteger(n) && n >= 0) return n;
   console.warn(
-    `[config] TRUST_PROXY "${value}" is not recognized (expected a number, "true", or ` +
-      `"false"); defaulting to false so the rate-limiter client IP stays unspoofable`
+    `[config] TRUST_PROXY "${value}" is not recognized (expected a non-negative integer, ` +
+      `"true", or "false"); defaulting to false so the rate-limiter client IP stays unspoofable`
   );
   return false;
+}
+
+// Parse DEFAULT_MAP_LANGUAGE into an ALS label-language code. Unset → "en".
+// An unsupported value is a configuration MISTAKE, not something to paper over:
+// it would leave every map silently English while the operator believes
+// otherwise, so throw at startup and name the offending value.
+function parseDefaultMapLanguage(value) {
+  if (value === undefined || value === "") return DEFAULT_MAP_LANGUAGE;
+  const lang = normalizeLanguage(value);
+  if (lang.error) {
+    throw new Error(`DEFAULT_MAP_LANGUAGE is invalid: ${lang.error}`);
+  }
+  return lang.code;
+}
+
+// Parse a positive finite numeric setting. Invalid operator input must fail at
+// startup rather than silently disabling throttling or making a cache unbounded.
+function parsePositiveNumber(name, value, fallback, { integer = false } = {}) {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0 || (integer && !Number.isInteger(parsed))) {
+    const kind = integer ? "positive integer" : "positive finite number";
+    throw new Error(`${name} must be a ${kind}; received "${value}"`);
+  }
+  return parsed;
 }
 
 // Read raw config from process.env plus the mapping-derived region set and home
@@ -79,19 +106,29 @@ function loadConfig(env = process.env, mapping = {}) {
   // CORS allowlist (default closed) + baseline per-IP rate limit for /api.
   const allowedOrigins = parseAllowedOrigins(env.ALLOWED_ORIGINS);
   const rateLimit = {
-    ratePerSec: Number(env.API_RATE_PER_SEC) || 10,
-    burst: Number(env.API_RATE_BURST) || 20,
+    ratePerSec: parsePositiveNumber("API_RATE_PER_SEC", env.API_RATE_PER_SEC, 10),
+    burst: parsePositiveNumber("API_RATE_BURST", env.API_RATE_BURST, 20, { integer: true }),
   };
   // Express 'trust proxy' setting. Behind CloudFront→ALB the client IP used for
   // rate limiting must be UNSPOOFABLE: a numeric hop count (e.g. 2) makes Express
   // read the IP a fixed number of hops from the right of X-Forwarded-For, so a
   // viewer can't forge a leftmost entry to dodge the limiter. Set TRUST_PROXY=2
-  // in the CloudFront+ALB topology. Accepts a number, "true"/"false", or defaults
-  // to true (convenient locally; production should pin the hop count).
+  // in the CloudFront+ALB topology. Accepts a non-negative integer,
+  // "true"/"false", or defaults to false (fail-safe).
   const trustProxy = parseTrustProxy(env.TRUST_PROXY);
   // FIFO bound for the reverse-geocode grid cache (per-task backstop against
   // unbounded growth on a long-running, globally-distributed workload).
-  const reverseGeoCacheMax = Number(env.REVERSE_GEO_CACHE_MAX) || 200_000;
+  const reverseGeoCacheMax = parsePositiveNumber(
+    "REVERSE_GEO_CACHE_MAX",
+    env.REVERSE_GEO_CACHE_MAX,
+    200_000,
+    { integer: true }
+  );
+  // Map label language used when a request supplies neither an explicit language
+  // nor a country we have a language for. Validated here (fail fast at startup)
+  // rather than per request, so a typo can't silently degrade every map to
+  // English at runtime.
+  const defaultMapLanguage = parseDefaultMapLanguage(env.DEFAULT_MAP_LANGUAGE);
   const cfg = {
     homeRegion,
     routingEnabled,
@@ -102,8 +139,9 @@ function loadConfig(env = process.env, mapping = {}) {
     rateLimit,
     trustProxy,
     reverseGeoCacheMax,
+    defaultMapLanguage,
   };
   return validateConfig(cfg);
 }
 
-module.exports = { validateConfig, loadConfig };
+module.exports = { validateConfig, loadConfig, parseDefaultMapLanguage };

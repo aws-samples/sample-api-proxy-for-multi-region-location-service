@@ -59,14 +59,16 @@ Parameters:
   AllowedOrigins:
     Type: String
     Default: ""
-    Description: "CORS allowlist for /api (comma-separated origins). Empty = same-origin only."
+    Description: "CORS allowlist for /api (comma-separated origins). Empty = no cross-origin allow headers."
   ApiRatePerSec:
     Type: Number
     Default: 10
+    MinValue: 0.1
     Description: Sustained per-source-IP request rate for /api (token bucket refill)
   ApiRateBurst:
     Type: Number
     Default: 20
+    MinValue: 1
     Description: Per-source-IP burst capacity for /api (token bucket size)
   TrustProxy:
     Type: String
@@ -77,10 +79,25 @@ Parameters:
   ReverseGeoCacheMax:
     Type: Number
     Default: 200000
+    MinValue: 1
     Description: >-
       FIFO cap for the per-task reverse-geocode grid cache (backstop against
       unbounded growth). ~few tens of MB at the default; raise for very
       geographically-diverse traffic.
+  DefaultMapLanguage:
+    Type: String
+    Default: en
+    AllowedPattern: "[a-z]{2}"
+    Description: >-
+      Fallback map label language (ISO 639-1 two-letter code), used only when a
+      request supplies neither an explicit language nor a country to derive one
+      from. Per-country defaults live in config/map-languages.js. An unsupported
+      code makes the task fail at startup rather than silently rendering every
+      map in English, so a typo here blocks the deploy instead of degrading it.
+      Only a BARE two-letter code is accepted here — the app would also take a
+      full BCP 47 tag (zh-CN) and reduce it to its primary subtag, but the
+      regional part cannot affect the outcome, so this parameter rejects it
+      rather than accepting a value it would silently discard.
   ImageUri:
     Type: String
     Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/location-proxy:latest)
@@ -351,6 +368,8 @@ Resources:
               Value: !Ref TrustProxy
             - Name: REVERSE_GEO_CACHE_MAX
               Value: !Ref ReverseGeoCacheMax
+            - Name: DEFAULT_MAP_LANGUAGE
+              Value: !Ref DefaultMapLanguage
           Secrets:
             - Name: LOCATION_API_KEYS
               ValueFrom: !Ref LocationApiKeysSecretArn
@@ -414,8 +433,20 @@ Resources:
         Name: !Sub "${AWS::StackName}-ApiForwardAll"
         CookiesConfig:
           CookieBehavior: none
+        # The CORS headers MUST be forwarded explicitly. With a cache policy +
+        # origin request policy, the only headers CloudFront adds to an origin
+        # request automatically are Host, User-Agent and X-Amz-Cf-Id — viewer
+        # headers are NOT forwarded by default. Without `Origin` here the task
+        # never sees it, so ALLOWED_ORIGINS silently does nothing through the
+        # distribution (the CORS middleware short-circuits on a missing Origin)
+        # and preflights come back without allow headers.
+        # The API is credential-less, so no Cookie forwarding is needed.
         HeadersConfig:
-          HeaderBehavior: none
+          HeaderBehavior: whitelist
+          Headers:
+            - Origin
+            - Access-Control-Request-Method
+            - Access-Control-Request-Headers
         QueryStringsConfig:
           QueryStringBehavior: all
 
@@ -457,7 +488,10 @@ Resources:
             ViewerProtocolPolicy: redirect-to-https
             CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
-            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            # The API is read-only (every endpoint is a GET); OPTIONS is here for
+            # CORS preflights. Mutating methods are not allowed at the edge so
+            # they never reach the origin at all.
+            AllowedMethods: [GET, HEAD, OPTIONS]
             Compress: true
           - PathPattern: /health
             TargetOriginId: ALBOrigin

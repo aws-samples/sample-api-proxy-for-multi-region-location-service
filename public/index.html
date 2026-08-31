@@ -33,6 +33,13 @@
       background: #fff; border-radius: 8px; font-size: 12px; color: #555;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15); cursor: pointer;
     }
+    #country-input[aria-invalid="true"] { outline: 2px solid #d13212; }
+    .country-warning {
+      display: none; margin-top: 6px; padding: 6px 10px;
+      background: #fdf3f1; border-radius: 8px; font-size: 12px; color: #a3271a;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    }
+    .country-warning.active { display: block; }
     .suggestions {
       margin-top: 4px; background: #fff; border-radius: 8px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15);
@@ -55,7 +62,9 @@
     }
     .info-panel.active { display: block; }
     .info-panel h3 { margin-bottom: 8px; font-size: 15px; }
-    .info-panel p { color: #555; line-height: 1.5; }
+    /* pre-line so a multi-line detail string (address + place type) keeps its
+       line breaks — the text is set via textContent, which does not parse HTML. */
+    .info-panel p { color: #555; line-height: 1.5; white-space: pre-line; }
     .locate-btn {
       position: absolute; bottom: 24px; right: 16px; z-index: 10;
       width: 44px; height: 44px; border-radius: 50%; border: none;
@@ -77,6 +86,20 @@
     }
     .style-btn:hover { background: #f0f0f0; }
     .style-btn.active { background: #0073bb; color: #fff; }
+
+    .lang-picker {
+      position: absolute; top: 64px; right: 56px; z-index: 10;
+      display: flex; align-items: center; gap: 6px;
+      background: #fff; border-radius: 8px; padding: 6px 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+      font-size: 12px; color: #555;
+    }
+    .lang-picker select {
+      border: 1px solid #ddd; border-radius: 6px;
+      padding: 4px 6px; font-size: 12px; background: #fff; outline: none;
+      max-width: 160px;
+    }
+    .lang-picker .resolved { color: #888; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -89,6 +112,7 @@
       <input id="search-input" type="text" placeholder="🔍 搜索地址..." autocomplete="off" />
     </div>
     <div id="suggestions" class="suggestions"></div>
+    <div id="country-warning" class="country-warning" role="alert"></div>
     <label class="follow-toggle" title="选中某国结果后，自动把该国代码填入国家框，后续搜索沿用该国上下文。关闭则每次都从 HOME 全球搜索。">
       <input type="checkbox" id="context-follow" checked /> 跟随所选结果的国家上下文
     </label>
@@ -104,6 +128,12 @@
 
   <div class="style-switcher" id="style-switcher"></div>
 
+  <div class="lang-picker" title="地图标注语言。“自动”按国家代码决定（无国家时用服务端默认语言）。">
+    <label for="lang-select">标注语言</label>
+    <select id="lang-select"><option value="">自动（按国家）</option></select>
+    <span class="resolved" id="lang-resolved"></span>
+  </div>
+
   <script>
     let map, marker;
     // Frontend-owned display names for style ids (the backend returns only ids).
@@ -114,19 +144,157 @@
     // doesn't render globe and rebuilds the whole style on every setStyle (the
     // "Unimplemented: setProjection" warning + flicker). We strip it CLIENT-SIDE
     // so the backend stays generic — a client on MapLibre 5 can still use globe.
+    //
+    // Returns null on a failed load (e.g. 400 from a half-typed country code) so
+    // callers keep the current style instead of blanking the map.
+    // Returns { style, language, source } — the backend reports the label language
+    // it actually applied, which is the only way to show the resolved value while
+    // the picker is on "auto". Side-effect free so the CALLER decides whether the
+    // response is still current (see applyStyle): reporting the language here
+    // would let a slow, superseded response overwrite a newer one.
     async function loadStyle(url) {
-      const style = await fetch(url).then((r) => r.json());
-      delete style.projection;
-      return style;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          await reportApiError("Style load failed", res);
+          return null;
+        }
+        const language = res.headers.get("X-Map-Label-Language");
+        const source = res.headers.get("X-Map-Label-Language-Source");
+        const style = await res.json();
+        delete style.projection;
+        return { style, language, source };
+      } catch (err) {
+        console.warn("Style load failed:", err);
+        return null;
+      }
     }
     // The region whose tiles are currently shown. Starts at the home region
     // (map-config), and switches when a search result in another region is
     // selected. Kept explicit so we never infer routing from the map center.
     let activeRegion = null;
+    // The region we have most recently ASKED for. Distinct from activeRegion (the
+    // region actually rendered) so that a failed or superseded load can't leave us
+    // believing we switched — while still preventing duplicate loads for the same
+    // target. New requests are built from this one, because it is the intent.
+    let requestedRegion = null;
+    // Country/language intent carried by the newest full-style request. It is
+    // separate from the visible country box because context-follow may be off.
+    let requestedStyleCountry;
     let currentStyle = "Standard";
+    let activeStyle = "Standard";
     // User's real location (from the locate button), used as the search bias.
     // NOT the map center — the map center only reflects "what I last looked at".
     let userLocation = null;
+    // Map label language. "" means AUTO: send no ?lang and let the backend derive
+    // it from the country code (config/map-languages.js). Any other value is an
+    // explicit ISO 639-1 code that overrides the country default.
+    let currentLang = "";
+    // The country whose labels we last requested in auto mode. Used to detect
+    // when the auto language would change and the style must be refetched.
+    let labelCountry = "";
+    // --- Serializing map style mutations ---------------------------------------
+    // Two kinds of mutation touch the style and they are NOT interchangeable:
+    //   applyStyle()           replaces the WHOLE style (region / map-style change)
+    //   refreshLabelLanguage() patches text-field on the style already loaded
+    // One shared "newest wins" token is the wrong rule for that pair. A label
+    // patch would cancel an in-flight full load — leaving the tiles on the old
+    // region while activeRegion claimed the new one, after which switchTileRegion
+    // early-returns forever and the tiles never catch up. And a patch applied
+    // during MapLibre's asynchronous rebuild silently no-ops (the new layers don't
+    // exist yet) while the badge reports success. So:
+    //   - a newer full load supersedes an older full load
+    //   - a patch NEVER cancels a full load; it is deferred until the load settles
+    let styleLoadSeq = 0;
+    let styleLoadsInFlight = 0;
+    let labelPatchSeq = 0;
+    // Latest label request received while a full style load was in flight. The
+    // wrapper object is an intentional sentinel: `{ country: undefined }` is a
+    // real deferred request (explicit language or location-driven auto mode),
+    // while `null` alone means that nothing is queued.
+    let deferredLabel = null;
+
+    // Build a /api/map-style URL. Tiles come from `region`; the LABEL LANGUAGE is
+    // a separate decision: explicit currentLang, else the backend derives it from
+    // the country signal we pass (a region spans many countries, so the region is
+    // deliberately not used for language).
+    function styleUrl({ style, region, country } = {}) {
+      const p = new URLSearchParams();
+      p.set("style", style || currentStyle);
+      // requestedRegion, not activeRegion: a new request should target the region
+      // we are switching TO, even while that switch is still loading.
+      const r = region !== undefined ? region : requestedRegion;
+      if (r) p.set("region", r);
+      return `/api/map-style?${appendLanguageParams(p, country)}`;
+    }
+
+    // The language signal shared by /api/map-style and /api/map-labels: an
+    // explicit pick, else the country/location the backend derives the default
+    // from. Only well-formed 2-letter codes are sent — the country box is a
+    // free-text input and a half-typed value would 400.
+    function appendLanguageParams(p, country) {
+      if (currentLang) {
+        p.set("lang", currentLang);
+        return p;
+      }
+      const cc = (country !== undefined ? country : countryCode()).toUpperCase();
+      if (/^[A-Z]{2}$/.test(cc)) {
+        p.set("countryCode", cc);
+      } else if (userLocation) {
+        p.set("lat", userLocation.lat);
+        p.set("lng", userLocation.lng);
+      }
+      return p;
+    }
+
+    // Surface an API failure instead of only logging it. The case that matters is a
+    // well-formed but UNSERVED country code — "UK" (the ISO code is "GB") passes the
+    // /^[A-Z]{2}$/ check the request builder applies, so the backend 400s and the
+    // map silently stops following the country box. Without this the user gets no
+    // signal at all and the box looks accepted.
+    async function reportApiError(context, res) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body && body.error) message = body.error;
+      } catch {
+        /* non-JSON body; the status is enough */
+      }
+      console.warn(`${context}: ${message}`);
+      const aboutCountry = /countryCode/i.test(message);
+      setCountryWarning(aboutCountry ? message : "");
+    }
+
+    function setCountryWarning(message) {
+      const box = document.getElementById("country-input");
+      const el = document.getElementById("country-warning");
+      el.textContent = message || "";
+      el.classList.toggle("active", !!message);
+      if (message) box.setAttribute("aria-invalid", "true");
+      else box.removeAttribute("aria-invalid");
+    }
+
+    // Show which language the backend applied. In auto mode this is the country
+    // default, so it's the only feedback that the mapping did what was expected.
+    function showResolvedLang(code, source) {
+      const el = document.getElementById("lang-resolved");
+      if (!el || !code) return;
+      el.textContent = currentLang ? "" : `→ ${langLabel(code)}`;
+      el.title = `source: ${source || "unknown"}`;
+    }
+
+    // Localized language names without shipping a 68-entry translation table.
+    const langNames = (() => {
+      try {
+        return new Intl.DisplayNames([document.documentElement.lang || "en"], { type: "language" });
+      } catch {
+        return null;
+      }
+    })();
+    function langLabel(code) {
+      const name = langNames && langNames.of(code);
+      return name && name !== code ? `${name} (${code})` : code;
+    }
 
     // Optional country code: from the demo dropdown, or a host page setting
     // window.COUNTRY_CODE. Empty string when not set.
@@ -154,20 +322,37 @@
       // map opens inside the region's coverage instead of a hardcoded default.
       const cfgRes = await fetch("/api/map-config");
       const mapConfig = await cfgRes.json();
-      activeRegion = mapConfig.region; // home region initially drives the tiles
+      // Home region initially drives the tiles. Both are set: the initial style is
+      // fetched for it below, so it is both requested and (once loaded) rendered.
+      activeRegion = mapConfig.region;
+      requestedRegion = mapConfig.region;
 
       // Load available map style ids and render switcher buttons. Display names
       // are a UI concern owned by the frontend (the backend returns only ids).
       const stylesRes = await fetch("/api/map-styles");
       const styleIds = await stylesRes.json();
       const switcher = document.getElementById("style-switcher");
-      styleIds.forEach((id, i) => {
+      styleIds.forEach((id) => {
         const btn = document.createElement("button");
-        btn.className = "style-btn" + (i === 0 ? " active" : "");
+        btn.className = "style-btn" + (id === currentStyle ? " active" : "");
         btn.dataset.style = id;
         btn.textContent = STYLE_LABELS[id] || id;
         switcher.appendChild(btn);
       });
+
+      // Label-language picker. The list comes from the backend so the UI never
+      // holds a stale copy of the languages Amazon Location actually supports.
+      const langRes = await fetch("/api/map-languages");
+      const { languages } = await langRes.json();
+      const langSelect = document.getElementById("lang-select");
+      languages.forEach((code) => {
+        const opt = document.createElement("option");
+        opt.value = code;
+        opt.textContent = langLabel(code);
+        langSelect.appendChild(opt);
+      });
+      labelCountry = countryCode();
+      requestedStyleCountry = labelCountry || undefined;
 
       // Required for rendering RTL text (Arabic, Hebrew, etc.) in map labels
       maplibregl.setRTLTextPlugin(
@@ -176,16 +361,50 @@
         true // lazy load
       );
 
+      // Style is proxied through Express: descriptor fetched server-side, tile
+      // URLs rewritten to CloudFront, API key never exposed to browser. Loaded as
+      // an object (via loadStyle) so projection is stripped.
+      const initial = await loadStyle(styleUrl());
+      // Without a style there is no map at all. Say so plainly — dereferencing a
+      // failed load here would throw a cryptic TypeError inside init() and leave
+      // a blank page with no clue about the actual cause (a 4xx/5xx from the API).
+      if (!initial) {
+        document.getElementById("map").innerHTML =
+          '<p style="padding:24px;font:14px/1.6 sans-serif;color:#a00">' +
+          "地图样式加载失败：请检查后端 /api/map-style 是否正常。</p>";
+        return;
+      }
+      showResolvedLang(initial.language, initial.source);
+
       map = new maplibregl.Map({
         container: "map",
-        // Style is proxied through Express: descriptor fetched server-side,
-        // tile URLs rewritten to CloudFront, API key never exposed to browser.
-        // Loaded as an object (via loadStyle) so projection is stripped.
-        style: await loadStyle("/api/map-style"),
+        style: initial.style,
         center: mapConfig.center, // home region center (from /api/map-config)
         zoom: mapConfig.zoom,
+        // Amazon Location's glyph endpoint serves ZERO glyphs for the CJK
+        // ideograph, kana and Hangul ranges (verified against the live service),
+        // so zh/ja/ko labels can only come from locally rasterized system fonts.
+        // MapLibre already does that by default (this option defaults to
+        // 'sans-serif'); we only name better per-platform CJK faces. Setting this
+        // to `false` would disable local rasterization and make every CJK label
+        // disappear — don't.
+        localIdeographFontFamily: "'PingFang SC', 'Hiragino Sans', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif",
       });
       map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+      // Click anywhere to identify the place there. Registered here because the
+      // map only exists once init() has built it.
+      //
+      // MapLibre fires `click` for EACH click of a double-click. Defer the
+      // lookup briefly and cancel it when `dblclick` arrives, which avoids the
+      // normal double-click-to-zoom path without treating the timing as a hard
+      // cross-platform guarantee.
+      let clickTimer;
+      map.on("click", (e) => {
+        clearTimeout(clickTimer);
+        clickTimer = setTimeout(() => identifyClickedPlace(e), 260);
+      });
+      map.on("dblclick", () => clearTimeout(clickTimer));
 
       map.on('error', (e) => console.error('Map error:', e.error));
       map.once('styledata', () => {
@@ -213,16 +432,25 @@
       document.getElementById("info-panel").classList.add("active");
     }
 
-    // Debounced search
+    // Debounced search. Tokens invalidate both in-flight suggestion responses and
+    // result selections as soon as the user changes the query.
     let timer;
+    let suggestSeq = 0;
+    let selectionSeq = 0;
     const input = document.getElementById("search-input");
     const sugBox = document.getElementById("suggestions");
 
     input.addEventListener("input", () => {
       clearTimeout(timer);
+      const seq = ++suggestSeq;
+      selectionSeq++;
       const q = input.value.trim();
-      if (!q) { sugBox.classList.remove("active"); return; }
-      timer = setTimeout(() => fetchSuggestions(q), 300);
+      if (!q) {
+        sugBox.innerHTML = "";
+        sugBox.classList.remove("active");
+        return;
+      }
+      timer = setTimeout(() => fetchSuggestions(q, seq), 300);
     });
 
     input.addEventListener("focus", () => {
@@ -233,14 +461,21 @@
       if (!e.target.closest(".search-box")) sugBox.classList.remove("active");
     });
 
-    async function fetchSuggestions(query) {
+    async function fetchSuggestions(query, seq) {
       // Routing signals per the contract: countryCode / user location / neither.
       // The map center is deliberately NOT used.
       const params = routingParams();
       params.set("query", query);
+      // Keep search text in sync with an explicit map-language selection. In auto
+      // mode omit it so the backend derives the Places language from the same
+      // country/location context used for labels.
+      if (currentLang) params.set("lang", currentLang);
       try {
         const res = await fetch(`/api/suggest?${params}`);
         const items = await res.json();
+        // A newer input event owns the UI and country box, even if its debounced
+        // request has not started yet.
+        if (seq !== suggestSeq) return;
         // Unsupported countryCode (e.g. "UK", whose ISO code is "GB", or any
         // code not in the mapping) → backend returns 400. Drop the offending
         // code from the country box and retry globally (HOME fallback) so a
@@ -249,7 +484,7 @@
           const box = document.getElementById("country-input");
           if (box.value) {
             box.value = "";
-            return fetchSuggestions(query); // retry once, now without the bad code
+            return fetchSuggestions(query, seq); // retry once, now without the bad code
           }
         }
         // Guard against a non-array (e.g. an error object) so a bad response
@@ -280,6 +515,7 @@
         });
         sugBox.classList.toggle("active", items.length > 0);
       } catch (err) {
+        if (seq !== suggestSeq) return;
         console.error("Suggest failed:", err);
         sugBox.innerHTML = "";
         sugBox.classList.remove("active");
@@ -290,20 +526,139 @@
     // Returns true if a switch was started, false if already on that region.
     // `view` (optional {center:[lng,lat], zoom}) is the view to apply AFTER the
     // new style loads — pass the result location so setStyle doesn't clobber it.
-    function switchTileRegion(region, view) {
-      if (!region || region === activeRegion) return false;
-      activeRegion = region;
-      const target = view || { center: map.getCenter().toArray(), zoom: map.getZoom() };
-      loadStyle(`/api/map-style?style=${currentStyle}&region=${encodeURIComponent(region)}`).then((style) => {
-        map.setStyle(style);
-        map.once("styledata", () => {
-          map.setCenter(target.center);
-          map.setZoom(target.zoom);
-          map.resize();
-          map.triggerRepaint();
-        });
+    function switchTileRegion(region, view, country) {
+      if (!region || region === requestedRegion) return false;
+      requestedRegion = region;
+      requestedStyleCountry = country;
+      void applyStyle(styleUrl({ region, country }), view, {
+        region,
+        country,
+        style: currentStyle,
       });
       return true;
+    }
+
+    // Load a style and apply it, restoring `view` (default: the current view)
+    // once MapLibre finishes rebuilding. Newest full-style request wins. Region
+    // state is committed only after the newest style has actually rendered; a
+    // failed newest request rolls its intent back so the same target is retryable.
+    async function applyStyle(url, view, opts = {}) {
+      const target = view || { center: map.getCenter().toArray(), zoom: map.getZoom() };
+      const seq = ++styleLoadSeq;
+      // This load carries newer language intent than anything deferred before it.
+      deferredLabel = null;
+      styleLoadsInFlight++;
+
+      const rollbackLatestIntent = () => {
+        if (
+          seq === styleLoadSeq &&
+          opts.region !== undefined &&
+          requestedRegion === opts.region
+        ) {
+          requestedRegion = activeRegion;
+          requestedStyleCountry = labelCountry || undefined;
+        }
+      };
+
+      try {
+        const loaded = await loadStyle(url);
+        if (!loaded) {
+          rollbackLatestIntent();
+          return false;
+        }
+        if (seq !== styleLoadSeq) return false;
+
+        showResolvedLang(loaded.language, loaded.source);
+        // Register before setStyle so even a synchronous styledata emission is
+        // observed by test doubles and future MapLibre implementations.
+        const styleReady = new Promise((resolve) => map.once("styledata", resolve));
+        map.setStyle(loaded.style);
+        await styleReady;
+        if (seq !== styleLoadSeq) return false;
+
+        if (opts.region !== undefined) {
+          activeRegion = opts.region;
+          requestedRegion = opts.region;
+        }
+        if (opts.style !== undefined) activeStyle = opts.style;
+        if (!currentLang && opts.country !== undefined) labelCountry = opts.country;
+        map.setCenter(target.center);
+        map.setZoom(target.zoom);
+        map.resize();
+        map.triggerRepaint();
+        return true;
+      } catch (err) {
+        console.warn("Style apply failed:", err);
+        rollbackLatestIntent();
+        return false;
+      } finally {
+        styleLoadsInFlight--;
+        // Any finishing load may be the one that takes the global count to zero.
+        // deferredLabel was cleared whenever a newer full load started, so a
+        // remaining entry is necessarily newer than every load still settling.
+        if (deferredLabel && styleLoadsInFlight === 0) {
+          const { country } = deferredLabel;
+          deferredLabel = null;
+          refreshLabelLanguage(country);
+        }
+      }
+    }
+
+    // Update ONLY the label language on the style that is already loaded. In auto
+    // mode the language follows the country, so this runs whenever the country
+    // context changes — which, inside a multi-country region like eu-central-1
+    // (67 countries), is often. Refetching the whole descriptor for that would
+    // cost ~136 KB and a full setStyle rebuild (re-requesting glyphs and sprites,
+    // then restoring the view); /api/map-labels returns just the ~3 KB of
+    // text-field expressions, computed by the SAME server-side transform, and we
+    // assign them in place.
+    //
+    // Region and map-style changes still go through applyStyle — they need a new
+    // descriptor anyway, and it already carries the right language.
+    async function refreshLabelLanguage(country) {
+      if (!map) return;
+      if (!currentLang) requestedStyleCountry = country;
+      // A full load is in flight and will replace the whole style, labels included.
+      // Patching now would be wiped by setStyle, or land on layers that don't exist
+      // yet — silently, while the badge claimed success. Defer instead of racing.
+      if (styleLoadsInFlight > 0) {
+        deferredLabel = { country };
+        return;
+      }
+      const p = new URLSearchParams();
+      p.set("style", currentStyle);
+      if (requestedRegion) p.set("region", requestedRegion);
+      appendLanguageParams(p, country);
+      const patch = ++labelPatchSeq;
+      const loadAtStart = styleLoadSeq;
+      let data;
+      try {
+        const res = await fetch(`/api/map-labels?${p}`);
+        if (!res.ok) {
+          await reportApiError("Label language load failed", res);
+          return;
+        }
+        data = await res.json();
+      } catch (err) {
+        console.warn("Label language load failed:", err);
+        return;
+      }
+      // Discard when a newer patch superseded this one, or when a full style load
+      // started meanwhile — that load renders the language itself, so applying an
+      // older patch on top of it would be wrong as well as pointless.
+      if (patch !== labelPatchSeq || styleLoadSeq !== loadAtStart || styleLoadsInFlight > 0) return;
+      for (const [id, expr] of Object.entries(data.layers)) {
+        // The style may have changed under us (different styles expose different
+        // layer ids), and setLayoutProperty throws on an unknown layer.
+        if (map.getLayer(id)) map.setLayoutProperty(id, "text-field", expr);
+      }
+      showResolvedLang(data.language, data.source);
+      // Commit the auto-language country only after the patch succeeded. A failed
+      // request (for example countryCode=UK) must remain retryable when the user
+      // submits the same value again.
+      if (!currentLang) {
+        labelCountry = country !== undefined ? country : countryCode();
+      }
     }
 
     // Show a result: mark it, show info, and switch tiles to the region whose
@@ -313,7 +668,10 @@
     function showResult({ lng, lat, title, infoAddr, tileRegion, country }) {
       const view = { center: [lng, lat], zoom: 15 };
       showInfo(title, infoAddr, lng, lat);
-      const switching = switchTileRegion(tileRegion, view);
+      // The result's own country drives the auto label language, so labels match
+      // the area being shown even when context-follow is off (the country box
+      // stays empty then, but the style request still carries the country).
+      const switching = switchTileRegion(tileRegion, view, country);
       if (switching) {
         setMarker(lng, lat, title, view.zoom, /*noFly*/ true);
         map.jumpTo(view); // final view is set by switchTileRegion's styledata cb
@@ -327,9 +685,17 @@
       if (follow && country) {
         document.getElementById("country-input").value = country;
       }
+      // Same region but a different country (e.g. Germany -> France, both
+      // eu-central-1) means no tile switch happened, yet the auto language
+      // changed — refetch the style so the labels follow the country.
+      if (!switching && !currentLang && country && country !== labelCountry) {
+        refreshLabelLanguage(country);
+      }
     }
 
     async function selectSuggestion(item) {
+      const seq = ++selectionSeq;
+      suggestSeq++; // an in-flight suggestion list must not reopen after selection
       sugBox.classList.remove("active");
       input.value = item.text;
       try {
@@ -339,6 +705,7 @@
           const [lng, lat] = item.position;
           const addr = item.address;
           const tr = await fetch(`/api/tile-region?lat=${lat}&lng=${lng}`).then((r) => r.json());
+          if (seq !== selectionSeq) return;
           showResult({
             lng, lat, title: item.text,
             infoAddr: addr ? [addr.Street, addr.District, addr.Municipality].filter(Boolean).join(" ") : "",
@@ -351,8 +718,14 @@
         // region that produced the PlaceId). The response's tileRegion tells us
         // which region's tiles cover the result.
         if (!item.placeId) return;
-        const regionParam = item.region ? `?region=${encodeURIComponent(item.region)}` : "";
-        const place = await fetch(`/api/place/${item.placeId}${regionParam}`).then((r) => r.json());
+        const placeParams = routingParams();
+        if (item.region) placeParams.set("region", item.region);
+        if (currentLang) placeParams.set("lang", currentLang);
+        const placeQuery = placeParams.toString();
+        const place = await fetch(
+          `/api/place/${encodeURIComponent(item.placeId)}${placeQuery ? `?${placeQuery}` : ""}`
+        ).then((r) => r.json());
+        if (seq !== selectionSeq) return;
         if (place.position) {
           const [lng, lat] = place.position;
           showResult({
@@ -362,11 +735,13 @@
           });
         }
       } catch (err) {
+        if (seq !== selectionSeq) return;
         console.error("Select failed:", err);
       }
     }
 
-    // Style switcher — changes style but keeps the current tile region.
+    // Style switcher — changes style but keeps ownership of the newest requested
+    // tile region (including a region switch that is still loading).
     document.getElementById("style-switcher").addEventListener("click", async (e) => {
       const btn = e.target.closest(".style-btn");
       if (!btn) return;
@@ -377,17 +752,118 @@
       document.querySelectorAll(".style-btn").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
 
-      const center = map.getCenter();
-      const zoom = map.getZoom();
-      const regionParam = activeRegion ? `&region=${encodeURIComponent(activeRegion)}` : "";
-      map.setStyle(await loadStyle(`/api/map-style?style=${styleName}${regionParam}`));
-      map.once("styledata", () => {
-        map.setCenter(center);
-        map.setZoom(zoom);
-        map.resize();
-        map.triggerRepaint();
-      });
+      const region = requestedRegion;
+      const country = requestedStyleCountry;
+      const applied = await applyStyle(
+        styleUrl({ style: styleName, region, country }),
+        undefined,
+        { region, country, style: styleName }
+      );
+      if (!applied && currentStyle === styleName) {
+        currentStyle = activeStyle;
+        document.querySelectorAll(".style-btn").forEach((b) =>
+          b.classList.toggle("active", b.dataset.style === activeStyle)
+        );
+      }
     });
+
+    // Label language — "" (auto) lets the backend pick from the country code.
+    document.getElementById("lang-select").addEventListener("change", (e) => {
+      currentLang = e.target.value;
+      if (currentLang) {
+        document.getElementById("lang-resolved").textContent = "";
+        refreshLabelLanguage();
+        return;
+      }
+      // Going back to AUTO: reuse the country whose labels we last resolved, not
+      // just the country box. With "跟随" off the box stays empty, so after a map
+      // click in Japan the box says nothing while labelCountry says JP — passing
+      // undefined here would drop back to the deployment default instead of
+      // returning to the language auto mode was showing before.
+      refreshLabelLanguage(labelCountry || undefined);
+    });
+
+    // The country box is the auto-language input, so a change to it must refetch
+    // the style. "change" (not "input") so we don't reload on every keystroke.
+    document.getElementById("country-input").addEventListener("change", () => {
+      const cc = countryCode();
+      // Clear a stale warning; a fresh failure will set it again.
+      setCountryWarning("");
+      if (cc === labelCountry) return;
+      if (!currentLang) refreshLabelLanguage(cc);
+    });
+
+    // Identify whatever the user clicked on the map. Deliberately does NOT move
+    // the map: the user is already looking at the spot they clicked, so flying or
+    // zooming there (as selecting a search result does) would be disorienting.
+    let clickSeq = 0;
+    async function identifyClickedPlace(e) {
+      const { lng, lat } = e.lngLat;
+      const seq = ++clickSeq;
+      // Mark the spot immediately — the lookup is a round trip and the marker is
+      // the only feedback that the click registered.
+      setMarker(lng, lat, "查询中…", undefined, /*noFly*/ true);
+      showInfo("查询中…", "", lng, lat);
+
+      let data;
+      try {
+        const p = new URLSearchParams({ lat, lng });
+        // Only an EXPLICIT language is forwarded. In auto mode we deliberately
+        // send nothing so the backend derives it from the clicked position's own
+        // country — clicking in Japan should read Japanese, regardless of what
+        // country happens to be in the search box.
+        if (currentLang) p.set("lang", currentLang);
+        const res = await fetch(`/api/reverse-geocode?${p}`);
+        if (!res.ok) {
+          if (seq === clickSeq) showInfo("查询失败", `HTTP ${res.status}`, lng, lat);
+          return;
+        }
+        data = await res.json();
+      } catch (err) {
+        if (seq === clickSeq) showInfo("查询失败", String(err), lng, lat);
+        return;
+      }
+      // A newer click superseded this one — drop the stale answer.
+      if (seq !== clickSeq) return;
+
+      if (!data.place) {
+        setMarker(lng, lat, "无结果", undefined, true);
+        showInfo("无结果", "此处没有可识别的地点（海面或无数据区域）", lng, lat);
+        return;
+      }
+
+      const { label, address, position, placeType, distanceMeters } = data.place;
+      const title = label || "未命名地点";
+      // ALS returns the matched place's own position (snapped to a street or
+      // building), which is not the raw click — show the marker where ALS
+      // actually matched, so the label and the pin agree.
+      const [mLng, mLat] = position || [lng, lat];
+      setMarker(mLng, mLat, title, undefined, /*noFly*/ true);
+      // The backend may have had to CLAMP the language: GrabMaps documents only
+      // a small subset, so a Japanese-labelled map clicked in Singapore returns
+      // an English address. Say so rather than letting the picker imply otherwise.
+      const clamped = currentLang && data.language && data.language !== currentLang;
+      const detail = [
+        placeType,
+        distanceMeters != null ? `${Math.round(distanceMeters)} m` : null,
+        clamped ? `地址语言：${langLabel(data.language)}（该区域不支持 ${langLabel(currentLang)}）` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      showInfo(title, [address?.Label, detail].filter(Boolean).join("\n"), mLng, mLat);
+
+      // Same context handling as a search result: follow the clicked country so
+      // subsequent searches and the auto label language track it, and switch the
+      // tiles to the region whose data covers it (keeping the current view).
+      const switching = switchTileRegion(data.tileRegion, undefined, data.country);
+      const follow = document.getElementById("context-follow").checked;
+      if (follow && data.country) {
+        document.getElementById("country-input").value = data.country;
+      }
+      if (!switching && !currentLang && data.country && data.country !== labelCountry) {
+        refreshLabelLanguage(data.country);
+      }
+    }
 
     // Geolocation — records the user's REAL location as the search bias
     // (distinct from the map center) and centers the map on it.
@@ -399,6 +875,9 @@
           userLocation = { lat, lng };
           setMarker(lng, lat, "我的位置");
           showInfo("我的位置", "当前设备定位", lng, lat);
+          // With no country typed, the located position is now the auto-language
+          // signal (the backend reverse-geocodes it to a country).
+          if (!currentLang && !countryCode()) refreshLabelLanguage();
         },
         (err) => alert("定位失败: " + err.message),
         { enableHighAccuracy: true }

@@ -7,3 +7,5 @@ infra/cloudfront-map-proxy.yaml
 .claude/
 docs/superpowers/
 .remember/
+# Code review reports produced by the review agent — local artifacts, not source.
+semantic-review/

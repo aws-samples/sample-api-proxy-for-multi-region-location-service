@@ -337,3 +337,186 @@ test("reverseGeocodeCountry also retries transient 5xx", async () => {
   assert.strictEqual(cc, "SG");
   assert.strictEqual(state.calls, 2);
 });
+
+test("request timeout interrupts retry backoff and preserves the total budget", async () => {
+  let calls = 0;
+  const impl = async () => {
+    calls++;
+    return { ok: false, status: 500, text: async () => "temporary" };
+  };
+  // Deliberately ignore the AbortSignal: fetchOk's race must still enforce the
+  // budget even when an injected sleep implementation is not signal-aware.
+  const neverFinishes = () => new Promise(() => {});
+  const als = createAlsClient({
+    fetchImpl: impl,
+    sleep: neverFinishes,
+    maxRetries: 2,
+    backoffMs: 10_000,
+    requestTimeoutMs: 20,
+  });
+  const started = Date.now();
+  await assert.rejects(
+    () => als.suggest({ region: "eu-west-1", key: "k", query: "x" }),
+    (err) => err.code === "ALS_TIMEOUT"
+  );
+  assert.ok(Date.now() - started < 500, "timeout should not wait for the backoff");
+  assert.strictEqual(calls, 1, "no retry should start after the deadline");
+});
+
+// --- upstream cache-header logging (groundwork for a descriptor cache) ---
+// Captures console.log while running fn.
+async function captureLog(fn) {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(args.join(" "));
+  try {
+    await fn();
+  } finally {
+    console.log = original;
+  }
+  return lines;
+}
+// fake fetch whose response carries headers (the real fetch Response shape).
+function fakeFetchWithHeaders(headers, body = {}) {
+  return async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: (name) => headers[name.toLowerCase()] ?? null },
+    json: async () => body,
+  });
+}
+
+test("getStyleDescriptor logs the upstream cache headers", async () => {
+  const als = createAlsClient({
+    fetchImpl: fakeFetchWithHeaders({
+      "cache-control": "max-age=86400",
+      etag: '"abc123"',
+      age: "42",
+    }),
+  });
+  const lines = await captureLog(() =>
+    als.getStyleDescriptor({ region: "eu-west-1", key: "k", styleName: "Standard" })
+  );
+  assert.strictEqual(lines.length, 1);
+  assert.match(lines[0], /eu-west-1\/Standard/);
+  assert.match(lines[0], /cache-control=max-age=86400/);
+  assert.match(lines[0], /etag="abc123"/);
+  assert.match(lines[0], /age=42/);
+});
+
+test("cache headers are logged ONCE per (region, style), not per request", async () => {
+  // The point is to learn the real values, not to emit a line per request.
+  const als = createAlsClient({ fetchImpl: fakeFetchWithHeaders({ "cache-control": "max-age=1" }) });
+  const lines = await captureLog(async () => {
+    for (let i = 0; i < 5; i++) {
+      await als.getStyleDescriptor({ region: "eu-west-1", key: "k", styleName: "Standard" });
+    }
+    await als.getStyleDescriptor({ region: "eu-west-1", key: "k", styleName: "Monochrome" });
+    await als.getStyleDescriptor({ region: "us-east-1", key: "k", styleName: "Standard" });
+  });
+  assert.strictEqual(lines.length, 3, "one line per distinct (region, style)");
+  assert.ok(lines.some((l) => l.includes("eu-west-1/Standard")));
+  assert.ok(lines.some((l) => l.includes("eu-west-1/Monochrome")));
+  assert.ok(lines.some((l) => l.includes("us-east-1/Standard")));
+});
+
+test("the cache-header log never contains the API key", async () => {
+  // The request URL carries ?key=<apiKey>; logging it would leak the key to
+  // CloudWatch, so only region/style/headers may be logged.
+  const als = createAlsClient({ fetchImpl: fakeFetchWithHeaders({ etag: '"e"' }) });
+  const lines = await captureLog(() =>
+    als.getStyleDescriptor({ region: "eu-west-1", key: "v1.public.SUPERSECRET", styleName: "Standard" })
+  );
+  assert.strictEqual(lines.length, 1);
+  assert.ok(!lines[0].includes("SUPERSECRET"), "API key leaked into the log");
+  assert.ok(!lines[0].includes("key="), "request URL leaked into the log");
+});
+
+test("missing upstream cache headers log as (none) instead of throwing", async () => {
+  // Some responses (and the test fakes elsewhere in this file) carry no headers.
+  const als = createAlsClient({ fetchImpl: fakeFetch({}, {}) });
+  const lines = await captureLog(() =>
+    als.getStyleDescriptor({ region: "eu-west-1", key: "k", styleName: "Standard" })
+  );
+  assert.strictEqual(lines.length, 1);
+  assert.match(lines[0], /cache-control=\(none\).*etag=\(none\)/);
+});
+
+// --- reverseGeocodePlace (full place for a map click) ---
+
+test("reverseGeocodePlace posts [lng,lat] and the requested language", async () => {
+  const captured = {};
+  const als = createAlsClient({
+    fetchImpl: fakeFetch(captured, {
+      ResultItems: [
+        {
+          PlaceId: "p1",
+          PlaceType: "Street",
+          Title: "Unter den Linden",
+          Address: { Label: "Unter den Linden, Berlin", Country: { Code2: "DE" } },
+          Position: [13.39, 52.52],
+          Distance: 8,
+        },
+      ],
+    }),
+  });
+  const place = await als.reverseGeocodePlace({
+    region: "eu-central-1",
+    key: "k",
+    lat: 52.5,
+    lng: 13.4,
+    lang: "de",
+  });
+  const body = JSON.parse(captured.opts.body);
+  // ALS takes GeoJSON order: longitude first.
+  assert.deepStrictEqual(body.QueryPosition, [13.4, 52.5]);
+  assert.strictEqual(body.Language, "de");
+  assert.strictEqual(body.MaxResults, 1);
+  // IntendedUse is left unset (ALS defaults to SingleUse); sending Storage would
+  // change the billing rate and the terms that apply, so it must never be implicit.
+  assert.strictEqual(body.IntendedUse, undefined);
+  assert.strictEqual(captured.opts.method, "POST");
+  assert.match(captured.url, /places\.geo\.eu-central-1\.amazonaws\.com\/v2\/reverse-geocode/);
+
+  assert.strictEqual(place.title, "Unter den Linden");
+  assert.strictEqual(place.placeType, "Street");
+  assert.strictEqual(place.country, "DE");
+  assert.deepStrictEqual(place.position, [13.39, 52.52]);
+  assert.strictEqual(place.distanceMeters, 8);
+});
+
+test("reverseGeocodePlace omits Language when none is given", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { ResultItems: [] }) });
+  await als.reverseGeocodePlace({ region: "eu-central-1", key: "k", lat: 1, lng: 2 });
+  assert.strictEqual(JSON.parse(captured.opts.body).Language, undefined);
+});
+
+test("reverseGeocodePlace returns null when there is no result", async () => {
+  // Ocean / unmapped area: a legitimate empty answer, not an error.
+  const als = createAlsClient({ fetchImpl: fakeFetch({}, { ResultItems: [] }) });
+  const place = await als.reverseGeocodePlace({ region: "eu-central-1", key: "k", lat: 0, lng: -140 });
+  assert.strictEqual(place, null);
+});
+
+test("reverseGeocodePlace throws on a non-ok HTTP response", async () => {
+  const als = createAlsClient({ fetchImpl: fakeFetchError(400) });
+  await assert.rejects(
+    () => als.reverseGeocodePlace({ region: "ap-southeast-1", key: "k", lat: 1, lng: 1 }),
+    /reverseGeocodePlace.*400.*ap-southeast-1/
+  );
+});
+
+test("reverseGeocodeCountry still works after sharing the POST helper", async () => {
+  // Guards the refactor: the country-only path feeds the routing grid cache and
+  // must keep its exact behavior.
+  const captured = {};
+  const als = createAlsClient({
+    fetchImpl: fakeFetch(captured, { ResultItems: [{ Address: { Country: { Code2: "SG" } } }] }),
+  });
+  const cc = await als.reverseGeocodeCountry({ region: "ap-southeast-1", key: "k", lat: 1.35, lng: 103.82 });
+  assert.strictEqual(cc, "SG");
+  const body = JSON.parse(captured.opts.body);
+  assert.deepStrictEqual(body.QueryPosition, [103.82, 1.35]);
+  assert.strictEqual(body.Language, undefined, "the country lookup needs no language");
+});

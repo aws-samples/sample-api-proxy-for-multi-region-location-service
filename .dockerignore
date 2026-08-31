@@ -14,3 +14,5 @@ Dockerfile
 .env
 .dockerignore
 .gitignore
+# Code review reports produced by the review agent — local artifacts, not source.
+semantic-review

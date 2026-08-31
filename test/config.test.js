@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { validateConfig, loadConfig } = require("../src/config");
+const { validateConfig, loadConfig, parseDefaultMapLanguage } = require("../src/config");
 
 function base(overrides = {}) {
   return {
@@ -116,7 +116,7 @@ test("loadConfig throws when MAP_TILE_DOMAIN missing", () => {
   );
 });
 
-test("loadConfig defaults: no CORS origins (same-origin) and 10/s burst 20", () => {
+test("loadConfig defaults: no CORS allow origins and 10/s burst 20", () => {
   const cfg = loadConfig(
     { LOCATION_API_KEYS: '{"us-east-1":"k"}', MAP_TILE_DOMAIN: "d" },
     { regions: new Set(["us-east-1"]), homeRegion: "us-east-1" }
@@ -203,4 +203,60 @@ test("loadConfig parses MULTI_REGION_ROUTING=true", () => {
     { regions: new Set(["ap-northeast-1"]), homeRegion: "ap-northeast-1" }
   );
   assert.strictEqual(cfg.routingEnabled, true);
+});
+
+// --- DEFAULT_MAP_LANGUAGE ---
+// The fail-fast throw is this knob's entire justification: an unsupported code
+// would otherwise leave every map silently English while the operator believes
+// otherwise. It is also a documented guarantee in both READMEs.
+
+test("DEFAULT_MAP_LANGUAGE defaults to en when unset or empty", () => {
+  assert.strictEqual(parseDefaultMapLanguage(undefined), "en");
+  assert.strictEqual(parseDefaultMapLanguage(""), "en");
+});
+
+test("DEFAULT_MAP_LANGUAGE accepts a supported code and a full BCP 47 tag", () => {
+  assert.strictEqual(parseDefaultMapLanguage("ja"), "ja");
+  assert.strictEqual(parseDefaultMapLanguage("zh-CN"), "zh");
+  assert.strictEqual(parseDefaultMapLanguage("PT_br"), "pt");
+});
+
+test("DEFAULT_MAP_LANGUAGE throws on an unsupported code, naming the value", () => {
+  // "cn" is the classic mistake (Chinese is "zh"); "sw" is a real language ALS
+  // does not offer for labels. Both must stop the process, not degrade quietly.
+  for (const bad of ["cn", "sw", "klingon", "zz"]) {
+    assert.throws(
+      () => parseDefaultMapLanguage(bad),
+      (err) => err.message.includes("DEFAULT_MAP_LANGUAGE") && err.message.includes(bad),
+      `${bad} should throw and name itself`
+    );
+  }
+});
+
+test("loadConfig surfaces a bad DEFAULT_MAP_LANGUAGE as a startup failure", () => {
+  // End-to-end: the throw must escape loadConfig so main() exits non-zero and ECS
+  // never routes traffic to a task serving the wrong language.
+  const env = {
+    MULTI_REGION_ROUTING: "true",
+    LOCATION_API_KEYS: JSON.stringify({ "us-east-1": "k" }),
+    MAP_TILE_DOMAIN: "d.cloudfront.net",
+    DEFAULT_MAP_LANGUAGE: "cn",
+  };
+  assert.throws(
+    () => loadConfig(env, { regions: ["us-east-1"], homeRegion: "us-east-1" }),
+    /DEFAULT_MAP_LANGUAGE/
+  );
+});
+
+test("loadConfig exposes the parsed default language", () => {
+  const cfg = loadConfig(
+    {
+      MULTI_REGION_ROUTING: "true",
+      LOCATION_API_KEYS: JSON.stringify({ "us-east-1": "k" }),
+      MAP_TILE_DOMAIN: "d.cloudfront.net",
+      DEFAULT_MAP_LANGUAGE: "zh-CN",
+    },
+    { regions: ["us-east-1"], homeRegion: "us-east-1" }
+  );
+  assert.strictEqual(cfg.defaultMapLanguage, "zh");
 });

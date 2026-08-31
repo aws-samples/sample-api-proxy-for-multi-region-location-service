@@ -9,12 +9,24 @@ const { parseCoords } = require("./src/coords");
 const { createCorsMiddleware } = require("./src/cors");
 const { createTokenBucketLimiter } = require("./src/rateLimiter");
 const { regionCenter } = require("./config/region-centers");
+const {
+  normalizeLanguage,
+  normalizePlacesLanguage,
+  resolveMapLanguage,
+  clampPlacesLanguage,
+  applyPreferredLanguage,
+  extractLabelExpressions,
+} = require("./src/mapLanguage");
+const { MAP_LABEL_LANGUAGES } = require("./config/map-languages");
 
 const PORT = 3000;
 const MAPPING_FILE = path.join(__dirname, "config", "country-region-map.json");
 // Candidate ALS style ids probed at startup. Display names are a UI concern
 // and belong to the frontend, so the backend deals only in style ids.
 const ALL_STYLES = ["Standard", "Monochrome", "Hybrid", "Satellite"];
+// The label-language list is static, so build the sorted array once instead of
+// re-expanding and re-sorting the 68-entry Set on every request.
+const SORTED_MAP_LABEL_LANGUAGES = [...MAP_LABEL_LANGUAGES].sort();
 
 // Build the express app from injected dependencies (testable).
 function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles }) {
@@ -70,14 +82,19 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     res.status(500).json({ error: "Internal server error" });
   }
 
-  // Map an ALS failure to the right client status. A 4xx from ALS other than
-  // 403 means the REQUEST was bad (e.g. an invalid Filter value) → surface 4xx
-  // so it isn't mistaken for a server/region outage. 403 (bad/expired key) and
-  // 5xx/network are the deployment's problem → 500. Either way the body stays
-  // generic and the detail is logged (scrubbed) by fail500.
+  // Map an ALS failure to the right client status. A caller-caused ALS 4xx
+  // (other than 403/429) becomes 400. A 403 means the deployment key is bad,
+  // while a 429 after retries means the deployment is still upstream-throttled;
+  // both are server/upstream failures and therefore become a generic 500.
   function failAls(res, context, err) {
     const status = err && err.status;
-    if (typeof status === "number" && status >= 400 && status < 500 && status !== 403) {
+    if (
+      typeof status === "number" &&
+      status >= 400 &&
+      status < 500 &&
+      status !== 403 &&
+      status !== 429
+    ) {
       const scrub = (s) => String(s).replace(/([?&]key=)[^&\s]+/gi, "$1[REDACTED]");
       console.error(`${context}: ${scrub(err.stack || err.message || err)}`);
       return res.status(400).json({ error: "Invalid request" });
@@ -99,8 +116,10 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     return { code: cc };
   }
 
-  // Resolve target region for a request from countryCode or lat/lng.
-  async function targetRegionFor({ countryCode, lat, lng }) {
+  // Resolve the routing decision for a request from countryCode or lat/lng.
+  // Returns the full { targetRegion, source, countryCode } so callers can reuse
+  // the resolved country for language decisions instead of repeating a lookup.
+  async function resolveTargetFor({ countryCode, lat, lng }) {
     const result = await resolveRegion(
       { countryCode, lat, lng, routingEnabled: config.routingEnabled },
       {
@@ -112,7 +131,19 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     if (result.source.endsWith("fallback")) {
       console.warn(`[routing] fallback to ${result.targetRegion} (source=${result.source})`);
     }
-    return result.targetRegion;
+    return result;
+  }
+
+  // The country used to DEFAULT the label language, which is a DISPLAY concern and
+  // therefore independent of routing. Routing usually resolves a country already;
+  // when it did not attempt a lookup (routing disabled or an explicit region),
+  // resolve one here. If routing already attempted and failed, do not immediately
+  // repeat the same uncached failure and double the upstream load.
+  async function countryForLanguage({ resolvedCountry, routingSource, lat, lng }) {
+    if (resolvedCountry) return resolvedCountry;
+    if (routingSource && routingSource.startsWith("reverse-")) return null;
+    if (lat == null || lng == null) return null;
+    return reverseGeocoder.toCountry(lat, lng);
   }
 
   app.get("/health", (req, res) => res.json({ status: "ok" }));
@@ -128,8 +159,26 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     if (!coords.valid) return res.status(400).json({ error: coords.error });
     const country = normalizeCountry(countryCode);
     if (country.error) return res.status(400).json({ error: country.error });
+    const language = normalizePlacesLanguage(lang);
+    if (language.error) return res.status(400).json({ error: language.error });
     try {
-      const region = await targetRegionFor({ countryCode: country.code, lat: coords.lat, lng: coords.lng });
+      const target = await resolveTargetFor({ countryCode: country.code, lat: coords.lat, lng: coords.lng });
+      const region = target.targetRegion;
+      // GeoPlaces accepts BCP 47 independently of the map-label enum. An
+      // explicit language passes through (subject to the GrabMaps subset); auto
+      // mode follows the same country -> deployment-default chain as labels.
+      const requestedLanguage =
+        language.code ||
+        resolveMapLanguage({
+          countryCode: await countryForLanguage({
+            resolvedCountry: target.countryCode,
+            routingSource: target.source,
+            lat: coords.lat,
+            lng: coords.lng,
+          }),
+          defaultLanguage: config.defaultMapLanguage,
+        }).language;
+      const placesLanguage = clampPlacesLanguage(requestedLanguage, region, config.defaultMapLanguage);
       // Bias selection (BiasPosition is required by ALS suggest). Priority
       // matches the routing contract:
       //   - explicit countryCode -> bias to that region's center (country is
@@ -152,7 +201,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
         lat: biasLat,
         lng: biasLng,
         includeCountries,
-        lang,
+        lang: placesLanguage,
       });
       const suggestions = (data.ResultItems || [])
         .filter((item) => item.SuggestResultItemType === "Place" && item.Place)
@@ -179,15 +228,47 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     if (!coords.valid) return res.status(400).json({ error: coords.error });
     const reqCountry = normalizeCountry(countryCode);
     if (reqCountry.error) return res.status(400).json({ error: reqCountry.error });
+    const language = normalizePlacesLanguage(lang);
+    if (language.error) return res.status(400).json({ error: language.error });
+    if (regionParam && !config.enabledRegions.has(regionParam)) {
+      return res.status(400).json({ error: `Unsupported region "${regionParam}"` });
+    }
     try {
       // A PlaceId is region-scoped: GetPlace must run in the region that
       // produced it. The frontend passes ?region=<suggest's region> so we use
       // it directly; fall back to normal resolution only if absent.
-      const region =
-        regionParam && config.enabledRegions.has(regionParam)
-          ? regionParam
-          : await targetRegionFor({ countryCode: reqCountry.code, lat: coords.lat, lng: coords.lng });
-      const data = await als.getPlace({ region, key: keyFor(region), placeId: req.params.placeId, lang });
+      const explicitRegion = regionParam || null;
+      let region = explicitRegion;
+      let resolvedCountry = reqCountry.code;
+      let routingSource = null;
+      if (!region) {
+        const target = await resolveTargetFor({
+          countryCode: reqCountry.code,
+          lat: coords.lat,
+          lng: coords.lng,
+        });
+        region = target.targetRegion;
+        resolvedCountry = target.countryCode;
+        routingSource = target.source;
+      }
+      const requestedLanguage =
+        language.code ||
+        resolveMapLanguage({
+          countryCode: await countryForLanguage({
+            resolvedCountry,
+            routingSource,
+            lat: coords.lat,
+            lng: coords.lng,
+          }),
+          defaultLanguage: config.defaultMapLanguage,
+        }).language;
+      const placesLanguage = clampPlacesLanguage(requestedLanguage, region, config.defaultMapLanguage);
+      const data = await als.getPlace({
+        region,
+        key: keyFor(region),
+        placeId: req.params.placeId,
+        lang: placesLanguage,
+      });
       // tileRegion = the region whose map data covers the RESULT's country
       // (not necessarily the region that produced the PlaceId). The frontend
       // switches map tiles to it so a result shows its local map data.
@@ -196,6 +277,79 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
       res.json({ label: data.Title, position: data.Position, address: data.Address, tileRegion, country });
     } catch (err) {
       failAls(res, "GetPlace error", err);
+    }
+  });
+
+  // What is at this coordinate? Backs "click the map to identify a place".
+  //
+  // Two ALS calls by design: the first (inside resolveTargetFor) reverse-geocodes
+  // through the HOME region just to learn the country, so the DETAILED lookup can
+  // then run in the region whose provider actually covers that country — which is
+  // the whole point of regional routing (a Singapore click should be answered by
+  // GrabMaps data, not by the home region's). The country lookup is cached in
+  // ~1.1 km cells for one hour, with concurrent cold misses coalesced.
+  app.get("/api/reverse-geocode", async (req, res) => {
+    const coords = parseCoords(req.query.lat, req.query.lng);
+    if (!coords.valid) return res.status(400).json({ error: coords.error });
+    // Unlike the other endpoints, coordinates are the whole request here.
+    if (coords.lat == null) {
+      return res.status(400).json({ error: "lat and lng are required" });
+    }
+    const language = normalizePlacesLanguage(req.query.lang);
+    if (language.error) return res.status(400).json({ error: language.error });
+    try {
+      const target = await resolveTargetFor({ lat: coords.lat, lng: coords.lng });
+      const region = target.targetRegion;
+      // Same precedence as the map labels: an explicit pick wins, otherwise the
+      // clicked position's own country decides — so clicking in Japan yields a
+      // Japanese address, whether or not multi-region routing is on. Then clamp to
+      // the language subset documented for this region's provider. With an
+      // explicit language the country cannot affect the result, so do not pay for
+      // a second country lookup in single-region mode.
+      const requestedLanguage =
+        language.code ||
+        resolveMapLanguage({
+          countryCode: await countryForLanguage({
+            resolvedCountry: target.countryCode,
+            routingSource: target.source,
+            lat: coords.lat,
+            lng: coords.lng,
+          }),
+          defaultLanguage: config.defaultMapLanguage,
+        }).language;
+      const lang = clampPlacesLanguage(requestedLanguage, region, config.defaultMapLanguage);
+      const place = await als.reverseGeocodePlace({
+        region,
+        key: keyFor(region),
+        lat: coords.lat,
+        lng: coords.lng,
+        lang,
+      });
+      // No result is a legitimate answer (ocean, unmapped area), not an error —
+      // 200 with place:null lets the client say "nothing here" instead of
+      // showing a failure.
+      if (!place) {
+        // Same shape as the success branch (country included, just null) so a
+        // client never has to branch on which keys exist.
+        return res.json({ place: null, country: null, tileRegion: region, language: lang });
+      }
+      // tileRegion = the region whose map data covers the RESULT's country, which
+      // can differ from the region we queried (a click near a border).
+      const tileRegion = (place.country && mappingStore.getRegion(place.country)) || config.homeRegion;
+      res.json({
+        place: {
+          label: place.title || place.address?.Label || null,
+          address: place.address,
+          position: place.position,
+          placeType: place.placeType,
+          distanceMeters: place.distanceMeters,
+        },
+        country: place.country,
+        tileRegion,
+        language: lang,
+      });
+    } catch (err) {
+      failAls(res, "Reverse geocode error", err);
     }
   });
 
@@ -218,31 +372,135 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     }
   });
 
-  app.get("/api/map-style", async (req, res) => {
+  // Shared front half of /api/map-style and /api/map-labels: validate the query,
+  // pick the tile region, and decide the label language. Both endpoints MUST
+  // agree on these decisions — /api/map-labels exists only to deliver the same
+  // localization more cheaply, so any divergence here would be a bug.
+  // Returns { error, status } on bad input, else { region, label }.
+  async function resolveStyleRequest(req) {
     const styleName = req.query.style || "Standard";
-    const { countryCode, lat, lng, region: regionParam } = req.query;
+    const { countryCode, lat, lng, region: regionParam, lang } = req.query;
     if (!availableStyles.includes(styleName)) {
-      return res.status(400).json({ error: `Invalid style. Allowed: ${availableStyles.join(", ")}` });
+      return { status: 400, error: `Invalid style. Allowed: ${availableStyles.join(", ")}` };
     }
     const coords = parseCoords(lat, lng);
-    if (!coords.valid) return res.status(400).json({ error: coords.error });
+    if (!coords.valid) return { status: 400, error: coords.error };
     const country = normalizeCountry(countryCode);
-    if (country.error) return res.status(400).json({ error: country.error });
+    if (country.error) return { status: 400, error: country.error };
+    // Omitting ?lang is the normal case ("use the country's language"); a
+    // PRESENT but unsupported code is a client bug and 400s, so a typo like
+    // lang=cn (China's ISO 639-1 is "zh") never silently renders English.
+    const language = normalizeLanguage(lang);
+    if (language.error) return { status: 400, error: language.error };
+    if (regionParam && !config.enabledRegions.has(regionParam)) {
+      return { status: 400, error: `Unsupported region "${regionParam}"` };
+    }
+
+    // Explicit ?region lets the frontend switch map tiles to a selected
+    // result's region (e.g. a Singapore result -> GrabMaps tiles). It also makes
+    // the ROUTING decision moot, so resolving it would be pure waste.
+    const explicitRegion = regionParam || null;
+    let region = explicitRegion;
+    let resolvedCountry = country.code;
+    let routingSource = null;
+    if (!region) {
+      const target = await resolveTargetFor({
+        countryCode: country.code,
+        lat: coords.lat,
+        lng: coords.lng,
+      });
+      region = target.targetRegion;
+      resolvedCountry = target.countryCode;
+      routingSource = target.source;
+    }
+    // Label language: explicit ?lang wins; otherwise the country decides; otherwise
+    // the deployment default. The country is resolved ONLY when it can actually
+    // change the outcome — with an explicit ?lang it is irrelevant, so looking it up
+    // would be a wasted upstream call.
+    //
+    // NOTE: an explicit ?region does NOT influence the language — a region spans
+    // many countries, so "which tiles" and "which language" stay independent.
+    const label = resolveMapLanguage({
+      lang: language.code,
+      countryCode: language.code
+        ? null
+        : await countryForLanguage({
+            resolvedCountry,
+            routingSource,
+            lat: coords.lat,
+            lng: coords.lng,
+          }),
+      defaultLanguage: config.defaultMapLanguage,
+    });
+    return { styleName, region, label };
+  }
+
+  // Report the language that was actually applied, so a client in "auto" mode can
+  // show the resolved value instead of guessing. Headers rather than body fields,
+  // because /api/map-style's body must stay a valid MapLibre style (MapLibre warns
+  // about unknown top-level properties). Exposed for cross-origin callers, which
+  // otherwise can't read them.
+  function setLanguageHeaders(res, label) {
+    res.set("X-Map-Label-Language", label.language);
+    res.set("X-Map-Label-Language-Source", label.source);
+    res.set("Access-Control-Expose-Headers", "X-Map-Label-Language, X-Map-Label-Language-Source");
+  }
+
+  app.get("/api/map-style", async (req, res) => {
     try {
-      // Explicit ?region lets the frontend switch map tiles to a selected
-      // result's region (e.g. a Singapore result -> GrabMaps tiles).
-      const region =
-        regionParam && config.enabledRegions.has(regionParam)
-          ? regionParam
-          : await targetRegionFor({ countryCode: country.code, lat: coords.lat, lng: coords.lng });
+      const resolved = await resolveStyleRequest(req);
+      if (resolved.error) return res.status(resolved.status).json({ error: resolved.error });
+      const { styleName, region, label } = resolved;
       const style = await als.getStyleDescriptor({ region, key: keyFor(region), styleName });
-      res.json(als.rewriteStyle(style, { region, mapTileDomain: config.mapTileDomain }));
+      const rewritten = als.rewriteStyle(style, { region, mapTileDomain: config.mapTileDomain });
+      setLanguageHeaders(res, label);
+      res.json(applyPreferredLanguage(rewritten, label.language));
     } catch (err) {
       failAls(res, "Map style error", err);
     }
   });
 
+  // Just the localized label expressions for a style, keyed by layer id — the
+  // cheap path for changing ONLY the language on a map that is already loaded.
+  // ~3 KB versus ~136 KB for the full descriptor, and the client applies them
+  // with setLayoutProperty, avoiding a setStyle rebuild (which re-requests glyphs
+  // and sprites and has to restore the view afterwards).
+  //
+  // Same query contract as /api/map-style, and the same server-side transform, so
+  // the labels are identical to what a full reload would produce. The language
+  // decision and the expression rewriting never move to the client — the client
+  // only assigns the returned values. Note this still costs one upstream
+  // GetStyleDescriptor call; it saves browser bandwidth and the rebuild, not ALS.
+  app.get("/api/map-labels", async (req, res) => {
+    try {
+      const resolved = await resolveStyleRequest(req);
+      if (resolved.error) return res.status(resolved.status).json({ error: resolved.error });
+      const { styleName, region, label } = resolved;
+      const style = await als.getStyleDescriptor({ region, key: keyFor(region), styleName });
+      // rewriteStyle is deliberately skipped: it only touches tile/glyph/sprite
+      // URLs and strips nulls from paint/layout, none of which affects the
+      // text-field expressions extracted below. Skipping it keeps this path cheap.
+      const localized = applyPreferredLanguage(style, label.language);
+      setLanguageHeaders(res, label);
+      res.json({
+        language: label.language,
+        source: label.source,
+        layers: extractLabelExpressions(localized),
+      });
+    } catch (err) {
+      failAls(res, "Map labels error", err);
+    }
+  });
+
   app.get("/api/map-styles", (req, res) => res.json(availableStyles));
+
+  // Label languages this deployment can render, so a frontend builds its picker
+  // from the server's list instead of hardcoding a copy of the ALS enum that
+  // silently drifts. `default` is what a request with no ?lang and no country
+  // resolves to.
+  app.get("/api/map-languages", (req, res) => {
+    res.json({ languages: SORTED_MAP_LABEL_LANGUAGES, default: config.defaultMapLanguage });
+  });
 
   // Initial map view: the home region's representative center/zoom, so the map
   // opens inside coverage (critical for GrabMaps regions) instead of a
@@ -255,28 +513,23 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   return app;
 }
 
-// Detect which styles exist in the home region (startup).
+// Detect which styles exist in the home region (startup). A transient probe
+// failure rejects startup instead of producing task-specific partial contracts.
 async function detectStyles(als, config) {
   const region = config.homeRegion;
   const key = config.keyMap.get(region);
   const results = await Promise.all(
-    ALL_STYLES.map(async (styleName) => {
-      try {
-        return (await als.styleExists({ region, key, styleName })) ? styleName : null;
-      } catch {
-        return null;
-      }
-    })
+    ALL_STYLES.map(async (styleName) =>
+      (await als.styleExists({ region, key, styleName })) ? styleName : null
+    )
   );
   const available = results.filter(Boolean);
-  // A transient ALS blip at boot can make every probe fail, leaving a task that
-  // passes /health but serves no styles (empty switcher + 400 on every
-  // map-style). Fail fast instead so ECS never routes traffic to it and
-  // replaces it — a healthy region always has at least "Standard".
-  if (!available.length) {
+  // The frontend's initial style is Standard. Starting without it would pass
+  // /health but render a blank page; fail fast so ECS replaces the task.
+  if (!available.includes("Standard")) {
     throw new Error(
-      `No map styles detected in home region ${region} (probed: ${ALL_STYLES.join(", ")}). ` +
-        `ALS may be unreachable or the API key is invalid — refusing to start.`
+      `Required map style Standard is unavailable in home region ${region} ` +
+        `(probed: ${ALL_STYLES.join(", ")}) — refusing to start.`
     );
   }
   return available;
@@ -308,15 +561,17 @@ async function main() {
     console.log(`   Regions (from mapping): ${[...config.enabledRegions].join(", ")}`);
     console.log(`   Mapping entries: ${mappingStore.size}`);
     console.log(`   Available styles: ${availableStyles.join(", ")}`);
+    console.log(`   Default map label language: ${config.defaultMapLanguage} (per-country defaults in config/map-languages.js)`);
     console.log(
-      `   CORS allowlist: ${config.allowedOrigins.length ? config.allowedOrigins.join(", ") : "(none — same-origin only)"}`
+      `   CORS allowlist: ${config.allowedOrigins.length ? config.allowedOrigins.join(", ") : "(none — cross-origin reads disabled)"}`
     );
     console.log(`   API rate limit: ${config.rateLimit.ratePerSec}/s (burst ${config.rateLimit.burst}) per source IP`);
   });
 
   // Graceful shutdown: on ECS deploy/scale-in the task gets SIGTERM. Stop
-  // accepting new connections and let in-flight requests finish before exit, so
-  // a rolling deploy drops zero requests. A timeout guards against hung sockets.
+  // accepting new connections and let in-flight requests finish before exit to
+  // reduce dropped requests during rolling deploys. A timeout guards against
+  // hung sockets.
   const shutdown = (signal) => {
     console.log(`${signal} received — shutting down gracefully`);
     server.close(() => {

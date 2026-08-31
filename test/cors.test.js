@@ -25,7 +25,7 @@ test("parseAllowedOrigins splits a comma list and trims", () => {
   );
 });
 
-test("parseAllowedOrigins returns [] for empty/undefined (same-origin only)", () => {
+test("parseAllowedOrigins returns [] for empty/undefined (no cross-origin headers)", () => {
   assert.deepStrictEqual(parseAllowedOrigins(undefined), []);
   assert.deepStrictEqual(parseAllowedOrigins(""), []);
   assert.deepStrictEqual(parseAllowedOrigins("   "), []);

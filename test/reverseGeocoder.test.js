@@ -2,9 +2,9 @@ const { test } = require("node:test");
 const assert = require("node:assert");
 const { gridKey, createReverseGeocoder } = require("../src/reverseGeocoder");
 
-test("gridKey truncates to 1 decimal place", () => {
-  assert.strictEqual(gridKey(52.567, 13.412), "52.5,13.4");
-  assert.strictEqual(gridKey(-0.04, -0.09), "0.0,0.0"); // -0.0 normalized
+test("gridKey truncates to 2 decimal places", () => {
+  assert.strictEqual(gridKey(52.567, 13.412), "52.56,13.41");
+  assert.strictEqual(gridKey(-0.004, -0.009), "0.00,0.00"); // -0.00 normalized
 });
 
 test("caches by grid: same grid calls underlying once", async () => {
@@ -17,8 +17,8 @@ test("caches by grid: same grid calls underlying once", async () => {
       return "JP";
     },
   });
-  const a = await rg.toCountry(35.68, 139.76);
-  const b = await rg.toCountry(35.69, 139.79); // same 35.6,139.7 grid
+  const a = await rg.toCountry(35.681, 139.761);
+  const b = await rg.toCountry(35.689, 139.769); // same 35.68,139.76 grid
   assert.strictEqual(a, "JP");
   assert.strictEqual(b, "JP");
   assert.strictEqual(calls, 1);
@@ -64,8 +64,8 @@ test("does NOT cache a thrown failure (transient errors must be retryable)", asy
       return "JP";
     },
   });
-  const first = await rg.toCountry(35.6, 139.7); // throws inside → null, not cached
-  const second = await rg.toCountry(35.62, 139.72); // same grid, retried → JP
+  const first = await rg.toCountry(35.601, 139.701); // throws inside → null, not cached
+  const second = await rg.toCountry(35.609, 139.709); // same grid, retried → JP
   assert.strictEqual(first, null);
   assert.strictEqual(second, "JP");
   assert.strictEqual(calls, 2);

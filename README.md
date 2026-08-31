@@ -6,16 +6,16 @@ Server-side proxy for address autocomplete + map positioning, built with Amazon 
 
 ## Highlights
 
-**Zero API Key Exposure**: Official Amazon Location Service examples typically embed the API Key directly in frontend code, making it visible to anyone via browser DevTools. This project uses a dual-layer architecture — server-side proxy + CloudFront edge injection — to ensure the API Key never reaches the client, eliminating the risk of key leakage.
+**API Keys Stay Off the Client**: Official Amazon Location Service examples typically embed the API key in frontend code, where it is visible in browser DevTools. This project uses a server-side proxy plus CloudFront edge injection so keys do not appear in browser requests or responses, reducing client-side leakage risk.
 
 - Address search requests are proxied through the Express backend; the API Key is used only on the server side
 - Map tile requests go through CloudFront, where a CloudFront Function injects the API Key at the edge; browser requests carry no credentials
 - The style descriptor is fetched server-side, tile URLs are rewritten, and all key parameters are stripped before returning to the frontend
-- The API Key is stored in AWS Secrets Manager for secure rotation
+- API keys are stored in AWS Secrets Manager; after rotation, redeploy the CloudFront map proxy and ECS tasks so they load the new values
 
 **Multi-Region Routing**: Different ALS regions carry different map data providers and region-specific optimizations (e.g. GrabMaps in Southeast Asia). This proxy routes each request to the region matching its country, so users get the best local map/search quality. Routing is driven by a country→region mapping and can be toggled on/off with a single switch.
 
-**Auto Scaling to Reduce Cost**: The production environment uses ECS Fargate with Auto Scaling, automatically adjusting the number of service instances based on CPU utilization. Scales down to minimum instances during low traffic and scales out during peak hours, avoiding the cost of fixed capacity. CloudFront edge caching further reduces origin requests and API call costs.
+**Auto Scaling to Reduce Cost**: The production environment uses ECS Fargate with Auto Scaling to adjust capacity between its minimum task count and configured maximum based on CPU utilization. Low traffic still retains the minimum tasks required for availability, while peaks scale out automatically; CloudFront caching further reduces origin traffic.
 
 ## Features
 
@@ -24,6 +24,8 @@ Server-side proxy for address autocomplete + map positioning, built with Amazon 
 - 🗺️ Interactive map display (MapLibre GL + Amazon Location Map Tiles)
 - 🎨 Map style switching (Standard / Monochrome / Hybrid / Satellite)
 - 🌏 Country-based routing to the matching ALS region (search + map tiles)
+- 🔤 Selectable map label language, defaulted from the country code (see "Map label language")
+- 👆 Click anywhere on the map to identify the place there (reverse geocoding, see "Identify a place by clicking the map")
 
 ## How Multi-Region Routing Works
 
@@ -52,7 +54,9 @@ Browser
 
 ## API protection & security notes
 
-**CORS (`/api`)** — Default closed: with `ALLOWED_ORIGINS` unset, no CORS headers are sent, so only same-origin callers work. Because the proxy is the deliverable and a customer may host their own frontend on a different origin, set `ALLOWED_ORIGINS` to opt those origins in. Avoid `*` in production — it lets any website call your API and burn the account's ALS quota. The API carries no cookies/credentials (keys stay server-side), so this is about *who may call*, not CSRF.
+**CORS (`/api`)** — With `ALLOWED_ORIGINS` unset, no CORS allow headers are sent, so cross-origin browser JavaScript cannot read responses. Configure explicit frontend origins when cross-origin access is needed. CORS is not authentication or a quota boundary: non-browser clients can omit or spoof `Origin`, and a browser may still send a disallowed simple request while hiding its response from script. Avoid `*` in production, and use rate limiting, WAF, and origin protection to control abuse. The API carries no cookies or client credentials, so CSRF is not the concern here.
+
+> Behind CloudFront, forward `Origin`, `Access-Control-Request-Method`, and `Access-Control-Request-Headers`; `infra/ecs-fargate.yaml` already does so.
 
 **Rate limiting (`/api`)** — A baseline per-source-IP token bucket (`API_RATE_PER_SEC` sustained + `API_RATE_BURST` spike) throttles abuse; `/health` is exempt so the ALB health check is never throttled. It is a **floor, not a WAF replacement**: per-task (in-memory), so with N ECS tasks the global rate is up to N × `API_RATE_PER_SEC`. For a global cap at the CloudFront edge, attach the optional WAF rule ([step 4](#4-optional-edge-rate-limiting-with-aws-waf)). `TRUST_PROXY=2` (the CloudFront→ALB hop count) keys the limiter on the real, unspoofable client IP, not the ALB's.
 
@@ -61,6 +65,52 @@ Browser
 **CloudFront → ALB origin traffic (plaintext)** — Viewer HTTPS terminates at CloudFront; the CloudFront→ALB hop is HTTP but travels the **AWS backbone**, not the public internet. So the residual exposure is plaintext query terms/coordinates on AWS infrastructure — never credentials (neither the ALS key nor the `X-Origin-Verify` secret leaves the backbone). We leave it plaintext by default; to encrypt it, put an ACM cert on a custom ALB domain and point CloudFront's origin at it (the default `*.elb.amazonaws.com` name can't hold an ACM cert).
 
 **Security response headers** — Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, and `Referrer-Policy: no-referrer`. The CSP is limited to `frame-ancestors` because the API returns JSON; a frontend embedding it applies its own full CSP.
+
+## API endpoints
+
+Every endpoint is a `GET` returning JSON. `/api/*` applies the CORS response policy and per-source-IP token bucket; `/health` deliberately sits outside `/api` so the ALB health check is never rate limited.
+
+**Shared routing parameters** (they decide which ALS region serves the request — see "How Multi-Region Routing Works" for the precedence):
+
+| Parameter | Notes |
+|---|---|
+| `countryCode` | ISO 3166-1 alpha-2. Highest precedence, and also applied as a hard filter. Must be a country served by the mapping file, otherwise 400 |
+| `lat` / `lng` | Decimal degrees, **both or neither**. Range `lat∈[-90,90]`, `lng∈[-180,180]`, otherwise 400 |
+
+**Language parameter:** `lang` is optional and accepts BCP 47 tags such as `zh-CN`. `/api/map-style` and `/api/map-labels` reduce it to a primary ISO 639-1 code and require that code to be in the configured 68-language label list. `/api/suggest`, `/api/place`, and `/api/reverse-geocode` use the independent GeoPlaces language contract: the canonical tag is preserved (`zh-CN` stays `zh-CN`), a malformed tag returns 400, a tag whose primary language appears in neither Amazon Location list (`lang=cn`, `lang=xx`) also returns 400 rather than spending an upstream call to be told the same, and requests routed to GrabMaps are clamped to that provider's documented subset.
+
+**When `lang` is omitted, these three endpoints do not fall back to English** — they follow the same chain as the map labels: the request's `countryCode` (or the country reverse-geocoded from `lat`/`lng`) decides, then `DEFAULT_MAP_LANGUAGE`. So a Tokyo search reads Japanese without the client asking. Two consequences worth knowing:
+
+- This differs from a plain GeoPlaces call, which defaults to English. A client that wants English regardless of location must pass `lang=en` explicitly.
+- Deriving the country from `lat`/`lng` requires reverse geocoding. Each task caches a roughly 1.1 km grid cell for one hour, and concurrent misses for the same cold cell share one upstream call. Passing `countryCode` — or an explicit `lang` — avoids this lookup.
+
+| Endpoint | Parameters | Returns |
+|---|---|---|
+| `/health` | — | `{"status":"ok"}` |
+| `/api/suggest` | `query` (required) + routing params + `lang` | `[{placeId, text, address, position, region}]`. An empty `query` returns `[]` (200) |
+| `/api/place/:placeId` | `region` + routing params + `lang` | `{label, position, address, tileRegion, country}` |
+| `/api/reverse-geocode` | `lat`+`lng` (**required**), `lang` | `{place, country, tileRegion, language}`; `place` may be `null` |
+| `/api/tile-region` | `lat`+`lng` | `{tileRegion, country}` |
+| `/api/map-style` | `style`, `region` + routing params | MapLibre style JSON (tile URLs rewritten, key stripped) |
+| `/api/map-labels` | same as `/api/map-style` | `{language, source, layers}` |
+| `/api/map-styles` | — | `["Standard","Monochrome",…]` (whatever was detected at startup) |
+| `/api/map-languages` | — | `{languages:[…], default:"en"}` |
+| `/api/map-config` | — | `{center:[lng,lat], zoom, region}` |
+
+Easy things to get wrong:
+
+- **`/api/place` needs its `region` echoed back.** A PlaceId is **region-scoped**, so GetPlace must run in the region that produced it — which is why every `/api/suggest` result carries `region` for the client to pass through. Omitting it falls back to normal region resolution and can miss the place entirely.
+- **`tileRegion` is not the region that was queried.** It is the region whose map data covers the **result's country**, for the client to switch tiles to; for a cross-border result the two differ.
+- **`/api/map-style` and `/api/map-labels` also return two headers**: `X-Map-Label-Language` and `X-Map-Label-Language-Source` (`explicit` / `country-map` / `config-default` / `fallback`), exposed to cross-origin callers via `Access-Control-Expose-Headers`.
+- **`place: null` from `/api/reverse-geocode` is a valid answer** (open ocean or unmapped area), not an error. Both branches return the same keys — `country` is simply `null` — so a client never has to check which fields exist.
+
+**Errors** are always `{"error":"…"}`:
+
+| Status | Meaning |
+|---|---|
+| 400 | Invalid request input (coordinate format/range, unsupported `countryCode` / `region` / map-label `lang` / `style`, or malformed/unsupported Places BCP 47 `lang`), or a caller-caused upstream ALS 4xx. The body is generic; details stay in the server log |
+| 429 | Per-source-IP rate limit exceeded, with a `Retry-After` header in seconds |
+| 500 | Server or upstream failure, including an invalid-key ALS 403, exhausted ALS 429 retries, timeout, or 5xx. The body is always `{"error":"Internal server error"}` and never leaks region, key, or upstream details |
 
 ## Prerequisites
 
@@ -81,14 +131,15 @@ The home region and the deploy region are independent: they can be the same or d
 
 | Variable | Description | Example |
 |---|---|---|
-| `MULTI_REGION_ROUTING` | Master switch; defaults to `false` (single-region: everything uses the home region). | `true` |
+| `MULTI_REGION_ROUTING` | Routing switch; defaults to `false` (single-region: everything uses the home region). | `true` |
 | `LOCATION_API_KEYS` | JSON of region→API Key (each key has geo-places + geo-maps). Provided as one Secrets Manager secret. | `{"ap-northeast-1":"v1.public.xxx"}` |
 | `MAP_TILE_DOMAIN` | CloudFront map-tile domain (output of the CloudFront stack). | `d123.cloudfront.net` |
-| `ALLOWED_ORIGINS` | CORS allowlist for `/api` (comma-separated). **Default closed**: unset ⇒ no CORS headers ⇒ same-origin only. Use `*` to allow any origin. | `https://app.example.com` |
+| `ALLOWED_ORIGINS` | CORS allowlist for `/api` (comma-separated). Unset means no CORS allow headers; this controls whether browser scripts can read cross-origin responses, not authentication. | `https://app.example.com` |
 | `API_RATE_PER_SEC` | Sustained per-source-IP request rate for `/api` (token-bucket refill). Default `10`. | `20` |
 | `API_RATE_BURST` | Per-source-IP burst capacity for `/api` (bucket size). Default `20`. | `40` |
 | `TRUST_PROXY` | Express `trust proxy` value — the proxy hop count so the rate limiter sees the real, unspoofable client IP. **Defaults to `false`** (fail-safe: an unset/empty or unrecognized value won't trust a client-supplied `X-Forwarded-For`, so the limiter can't be dodged; a bad value also warns). Behind CloudFront→ALB set it to `2` (the hop count) — the ECS stack passes `TrustProxy=2` by default. | `2` |
 | `REVERSE_GEO_CACHE_MAX` | FIFO cap for the per-task reverse-geocode grid cache (backstop against unbounded growth). Default `200000`. | `200000` |
+| `DEFAULT_MAP_LANGUAGE` | Fallback map label language (ISO 639-1), used only when a request has no explicit `lang` and no country to derive one from. Default `en`. An invalid value **fails at startup** rather than silently rendering every map in English. | `zh` |
 
 > The regions in use **and the home region** are **not** environment variables — they come from `config/country-region-map.json` (its keys, and the `"*"`-marked region). Locally the variables above are set via `export`; in production they are passed as CloudFormation parameters (see below). The two mechanisms are independent.
 
@@ -119,6 +170,90 @@ cp config/country-region-map-example.json config/country-region-map.json
 - **Single-region**: keep just one region, marked home, e.g. `{ "us-east-1": ["*"] }` (all countries fall back to it).
 
 The file is required at runtime: the app reads it on startup and fails fast if missing (the error tells you to run the `cp` above). `docker build` bakes it into the image, so it must exist before building too.
+
+## Identify a place by clicking the map
+
+Pan and zoom anywhere, then click to get the place at that point (reverse geocoding). The frontend sends the clicked coordinate to `GET /api/reverse-geocode?lat=&lng=&lang=`, which returns:
+
+```json
+{ "place": { "label": "東京駅", "address": { "Label": "…", "Locality": "千代田区" },
+             "position": [139.7671, 35.6812], "placeType": "PointAddress", "distanceMeters": 12.5 },
+  "country": "JP", "tileRegion": "ap-northeast-1", "language": "ja" }
+```
+
+Clicking also follows the country context: with "follow the selected result's country" checked it backfills the country box, and switches the tile region (keeping the current view) and label language as needed.
+
+> **The GrabMaps language subset.** AWS documents only `en, id, km, lo, ms, my, pt, th, tl, vi, zh` for GeoPlaces in `ap-southeast-1` / `ap-southeast-5`; it does not document fallback behavior outside that subset. Therefore a Singapore request made while labels are Japanese is clamped before it reaches GeoPlaces (`clampPlacesLanguage`) instead of relying on an undocumented downgrade or error response. The clamp prefers `DEFAULT_MAP_LANGUAGE` when that is itself documented there (a deployment serving Southeast Asia may well default to `th`), and only then falls back to `en`. Note this set and the 68 map label languages do not contain each other: it has `lo` and `tl`, which are not valid label languages. See the [GeoPlaces `Language` reference](https://docs.aws.amazon.com/cli/latest/reference/geo-places/reverse-geocode.html).
+>
+> The response's `language` field reports what was actually used, and the demo page shows it in the info panel when it differs from the picked language — so an English address under Japanese map labels reads as a deliberate degradation rather than a bug.
+
+> **`IntendedUse` is left at the default `SingleUse` (not persisted).** Storing reverse-geocode results requires setting it to `Storage` per the terms of service and is billed at a higher rate — that has to be an explicit decision, never a silent default.
+
+## Map label language
+
+Amazon Location's **dynamic (vector-tile) maps have no server-side language parameter** — `GetStyleDescriptor` accepts `ColorScheme` / `PoliticalView` / `Terrain` and friends, but not a language; only the raster `GetStaticMap` API takes `Language`. So this proxy follows the AWS-documented approach and rewrites each symbol layer's `text-field` in the style descriptor to prefer the tile's `name:<lang>` property ([preferred-language guide](https://docs.aws.amazon.com/location/latest/developerguide/how-to-set-preferred-language-map.html)):
+
+```
+["coalesce", ["get","name:zh"], ["get","name:en"], ["get","name"]]
+```
+
+The 68-code list in `config/map-languages.js` is transcribed from the documented [`GetStaticMap Language` values](https://docs.aws.amazon.com/cli/latest/reference/geo-maps/get-static-map.html) and conservatively reused for vector-tile `name:<lang>` properties. AWS does not publicly guarantee that the raster enum and vector-tile property set will always remain identical.
+
+`name:en` and `name` stay as fallbacks, so a feature with no translation still gets a label. The rewrite touches only the `/api/map-style` response — **tile URLs are unchanged**, so CloudFront caching and the tile proxy are unaffected (the tiles already carry every language's name field).
+
+How the language is decided:
+
+1. `GET /api/map-style?lang=<ISO 639-1>` — explicit, highest priority. Full BCP 47 tags are accepted (`zh-CN` → `zh`). An **unsupported value returns 400** (e.g. `lang=cn`; Chinese is `zh`) rather than silently falling back to English.
+2. **From the country code** (the default): the request's `countryCode`, or the country reverse-geocoded from `lat`/`lng`, is looked up in the `COUNTRY_LANGUAGE` table in `config/map-languages.js`. The reverse-geocoded country is reused from the routing decision, so this costs no extra ALS call.
+3. `DEFAULT_MAP_LANGUAGE` (default `en`).
+
+Note that `?region` only selects **which region serves the tiles** — it does not affect the language. A region spans many countries, so the two are deliberately independent decisions.
+
+The `X-Map-Label-Language` and `X-Map-Label-Language-Source` response headers report what was actually applied and why (`explicit` / `country-map` / `config-default` / `fallback`), which is how the frontend displays the current language while the picker is on "auto". `GET /api/map-languages` returns the selectable languages and the default, so a frontend builds its picker from the server instead of holding a copy of the list that goes stale.
+
+Per-country defaults live in `config/map-languages.js`. Where a country's main language is not among the 68 ALS supports (Sinhala for LK, Nepali for NP, Urdu for PK, Swahili for KE/TZ, Mongolian for MN), the table falls back to that country's common administrative language (usually `en`) — an unsupported code would just produce untranslated labels.
+
+The Satellite style has no label layers, and ALS documents it as not supporting language, so the rewrite is a no-op there.
+
+> **CJK labels depend on local font rasterization.** Measured against the live service, ALS's glyph endpoint returns **zero glyphs** for the CJK ideograph, kana and Hangul ranges, while every other script is served normally (Latin, Cyrillic, Arabic, Devanagari, Thai, Greek, Hebrew, Georgian, Khmer, Myanmar and the Indic scripts all come back populated). MapLibre already rasterizes those ranges from a local font **by default** — `localIdeographFontFamily` defaults to `'sans-serif'` — so the frontend only names better per-platform CJK faces. Setting that option to `false` disables local rasterization and makes every CJK label vanish, leaving only numeric road shields.
+
+### The cheap path for a language-only change
+
+Moving between countries inside one region (`eu-central-1` covers 67 countries and 38 languages) changes the language but not the tiles. Refetching the whole descriptor for that is expensive: ~136 KB, plus `map.setStyle()` rebuilds the entire style — re-requesting glyphs and sprites, dropping any client-added layers, and needing a callback to restore the view.
+
+`GET /api/map-labels` returns only the rewritten label expressions, keyed by layer id:
+
+```json
+{ "language": "fr", "source": "country-map",
+  "layers": { "place_label": ["coalesce",["get","name:fr"],["get","name:en"],["get","name"]], "...": [] } }
+```
+
+That's ~3 KB (45x smaller than the full descriptor), and the frontend assigns it in place with `map.setLayoutProperty(id, "text-field", expr)`. The query contract is identical to `/api/map-style` and the server reuses the same `applyPreferredLanguage`, so the result matches a full reload — the language decision and expression rewriting stay on the server while the client only assigns returned values.
+
+Region and map-style switches still go through `/api/map-style`: they need a fresh descriptor anyway, and that request already carries the right language.
+
+Note this saves browser bandwidth and the style rebuild, **not** the upstream ALS `GetStyleDescriptor` call. To cut ALS calls, add a server-side descriptor cache keyed by `(region, style)` instead — the next section records the upstream behavior measured for exactly that decision.
+
+### Upstream cache behavior (measured)
+
+`getStyleDescriptor` logs the upstream cache headers once per `(region, style)` (deduplicated, and never logging the URL — it carries `?key=`). Measured across 7 regions and 3 styles, 11 combinations, all identical:
+
+```
+cache-control=max-age=86400,must-revalidate   etag=(none)
+```
+
+Three consequences:
+
+- **`max-age` is 24 hours, which is long.** With hit rate `λT/(1+λT)`, a 24h TTL breaks even at one request per key per task per *day* — any real traffic clears that, so the TTL is never the binding constraint.
+- **There is no `ETag`.** Although the AWS docs list `ETag` among this API's response headers, real responses omit it (ruled out a logging miss and header stripping: ECS talks to `maps.geo.<region>.amazonaws.com` directly; only tiles go through CloudFront). So **cheap revalidation via `If-None-Match` is not possible** — expiry means a full refetch, never a 304.
+- **`must-revalidate`** means a stale response must not be reused without validating against the origin. Combined with the missing ETag, "validating" *is* a full refetch, so keep TTL ≤ 86400 and don't do stale-while-revalidate.
+
+With no validator available, **shortening the TTL is the only way to bound staleness**. The 26 descriptors total ~2.1 MB and refreshing is cheap (TTL=1h with all 26 keys active is ~50 MB/day/task; realistically only a few keys are hot, ~3 MB/day/task), so default to 1 hour and make it configurable up to 86400 — a few MB buys "an AWS style update appears within an hour" instead of a 24-hour blind spot.
+
+Two traps if you implement it:
+
+- **Cache the raw JSON string, not the parsed object.** `als.rewriteStyle()` mutates its input's `sources[*].tiles`, `glyphs` and `sprite` in place. Handing it a cached object rewrites the cached copy to its "already proxied" form on the first request; subsequent requests then find no original origin to `replace` and silently return an already-rewritten style. Caching strings and calling `JSON.parse` per request (~1 ms for 135 KB) is inherently safe and far smaller (2.1 MB measured, versus 15.1 MB as parsed objects).
+- **No Redis/ElastiCache needed.** 26 entries and 2.1 MB against a 512 MB task; and since any given `(region, style)` is equivalent within its TTL, there is no cross-task invalidation to coordinate. An in-process `Map` with a FIFO bound, mirroring `src/reverseGeocoder.js`, is enough.
 
 ## Deployment
 
@@ -243,12 +378,12 @@ aws ecr get-login-password --region <deploy-region> | \
   docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com
 
 # Build and push (config/country-region-map.json must exist — it is baked into the image)
-docker build -t location-proxy .
+docker build --platform linux/arm64 -t location-proxy .
 docker tag location-proxy:latest <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 docker push <ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest
 ```
 
-**b. Deploy the ECS Fargate stack** (in your deploy region). The regions and the home region both come from the mapping file baked into the image, so only `MultiRegionRouting` / the secret / domain / image plus the origin-verify secret are passed. Generate a strong `OriginVerifySecret` first (it lets the ALB reject any request that didn't come through this CloudFront distribution):
+**b. Deploy the ECS Fargate stack** (in your deploy region). The regions and home region come from the mapping file baked into the image. A first deployment needs the routing switch, API-key secret, map-tile domain, image, and origin-verification secret; `DefaultMapLanguage` is optional and defaults to `en`. Generate a strong `OriginVerifySecret` for the first deployment (it lets the ALB reject requests that did not come through this CloudFront distribution):
 
 ```bash
 ORIGIN_VERIFY_SECRET=$(openssl rand -hex 32)
@@ -262,17 +397,18 @@ aws cloudformation deploy \
     MultiRegionRouting=true \
     MapTileDomain=d1234567890.cloudfront.net \
     ImageUri=<ACCOUNT_ID>.dkr.ecr.<deploy-region>.amazonaws.com/location-proxy:latest \
+    DefaultMapLanguage=en \
     OriginVerifySecret=$ORIGIN_VERIFY_SECRET \
   --region <deploy-region>
 ```
 
 - **Single-region**: set `MultiRegionRouting=false` (the home region is whatever you marked `"*"` in the mapping).
-- **`OriginVerifySecret`** (required, min 16 chars): the shared secret CloudFront injects as `X-Origin-Verify`; the ALB 403s any request lacking it. Rotate by redeploying with a new value.
-- **Optional protection params** (sensible defaults, override as needed): `AllowedOrigins=https://app.example.com` (CORS allowlist for `/api`, default same-origin only), `ApiRatePerSec=10` / `ApiRateBurst=20` (per-source-IP `/api` rate limit), `TrustProxy=2` (CloudFront→ALB hop count for the real client IP; default already `2`), `WebACLArn=...` (attach an edge WAF — see the optional step below). See [API protection & security notes](#api-protection--security-notes).
+- **`DefaultMapLanguage`**: sets `DEFAULT_MAP_LANGUAGE` and defaults to `en`, so it may be omitted; the command above shows `en` explicitly to make the English default clear. It is used only when a request has neither an explicit language nor a country to derive one from. Change it to `zh` or another supported two-letter language code if needed; an unsupported value fails task startup.
+- **`OriginVerifySecret`** (required on the first deployment, minimum 16 characters): CloudFront injects this shared secret as `X-Origin-Verify`, and the ALB returns 403 when it is absent. **When updating an existing stack, you do not need to recover this `NoEcho` parameter's plaintext or generate another value: omit `OriginVerifySecret` from `--parameter-overrides` to retain the stack's current value.** Pass a new value only for an intentional rotation.
+- **Optional protection params** (sensible defaults, override as needed): `AllowedOrigins=https://app.example.com` (let that frontend read cross-origin `/api` responses), `ApiRatePerSec=10` / `ApiRateBurst=20` (per-source-IP `/api` rate limit), `TrustProxy=2` (CloudFront→ALB hop count for the real client IP; default already `2`), `WebACLArn=...` (attach an edge WAF — see the optional step below). See [API protection & security notes](#api-protection--security-notes).
 
-> **Redeploying code/mapping changes**: if you rebuild and push to the **same image tag** (`:latest`), `cloudformation deploy` sees no parameter change and reports *"No changes to deploy. Stack xxx is up to date"* — the running tasks keep the old image. Two ways to actually roll out:
-> - Force a new deployment (simplest): `aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>` (get `<cluster>`/`<service>` from the stack's `ClusterName` / `ServiceName` outputs).
-> - Or push an **immutable tag** (e.g. a git SHA) and pass it as `ImageUri=...:<sha>` — the changed parameter makes CloudFormation roll out automatically (recommended for production; also gives clean rollbacks).
+> **For later code/mapping-only updates**: if you rebuild and push to the same image tag (`:latest`) while the template and parameters remain unchanged, `cloudformation deploy` reports *"No changes to deploy"*. In that case:
+> - Run `aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment --region <deploy-region>`.
 
 **c. Get the access URL**:
 
@@ -283,6 +419,22 @@ aws cloudformation describe-stacks \
   --output text \
   --region <deploy-region>
 ```
+
+> **Page cache (only if an old page is still served after the update deployment)**: a CloudFront configuration deployment does not guarantee eviction of every previously cached object. If an edge location still returns the old `public/index.html`, or immediate page freshness must be guaranteed, invalidate the **application CloudFront** created by the ECS stack as needed (not the map-tile proxy from step 2):
+>
+> ```bash
+> DIST_ID=$(aws cloudformation describe-stacks \
+>   --stack-name location-proxy-ecs \
+>   --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontDistributionId`].OutputValue' \
+>   --output text \
+>   --region <deploy-region>)
+>
+> aws cloudfront create-invalidation \
+>   --distribution-id "$DIST_ID" \
+>   --paths "/" "/index.html"
+> ```
+>
+> `/api/*` uses a caching-disabled policy, so API responses do not need invalidation.
 
 ### 4. Optional: edge rate limiting with AWS WAF
 
@@ -311,7 +463,7 @@ aws cloudformation describe-stacks \
 
 ## Updating the country→region mapping
 
-Edit `config/country-region-map.json`, then rebuild and push the image. Roll it out with `aws ecs update-service --force-new-deployment` (or an immutable image tag — see the note under step b; `cloudformation deploy` alone does nothing when the tag is unchanged). ECS performs a zero-downtime rolling update. If you added a **new region**, first create its key and update the secret (rerun step 1) and regenerate + redeploy the CloudFront stack (step 2). A misconfigured mapping fails the startup validation, so the new task never becomes healthy and the old version keeps serving.
+Edit `config/country-region-map.json`, then rebuild and push the image. Roll it out with `aws ecs update-service --force-new-deployment` (or an immutable image tag — see the note under step b; `cloudformation deploy` alone does nothing when the tag is unchanged). The template maintains at least two healthy tasks during a rolling update, but downstream timeouts, insufficient capacity, or platform failures can still affect availability. If you added a **new region**, first create its key and update the secret (rerun step 1), then regenerate and redeploy the CloudFront stack (step 2). A misconfigured mapping fails startup validation, so the new task never becomes healthy and the old version keeps serving.
 
 ## Tests
 
