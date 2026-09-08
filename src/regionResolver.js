@@ -20,9 +20,13 @@ async function resolveRegion(input, deps) {
   // authoritative, so coords are ignored when both are present.
   if (countryCode) {
     const region = getRegion(countryCode);
-    return region
-      ? { targetRegion: region, source: "country-map", countryCode }
-      : { targetRegion: homeRegion, source: "country-map-miss-fallback", countryCode };
+    // Unlike a reverse-geocoded country (below), an explicit one gets no home
+    // fallback: the caller asked ABOUT that country, so answering from home
+    // would return results that contradict the request. The HTTP layer rejects
+    // an unserved code with 400 before reaching here, so a miss means a caller
+    // skipped that validation — a programming error, not a runtime condition.
+    if (!region) throw new Error(`countryCode "${countryCode}" is not in the region mapping`);
+    return { targetRegion: region, source: "country-map", countryCode };
   }
 
   if (lat != null && lng != null) {

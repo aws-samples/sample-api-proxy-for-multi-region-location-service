@@ -35,13 +35,16 @@ test("country code maps to its region", async () => {
   });
 });
 
-test("unmapped country falls back to home", async () => {
-  const r = await resolveRegion({ countryCode: "ZZ", routingEnabled: true }, deps());
-  assert.deepStrictEqual(r, {
-    targetRegion: HOME,
-    source: "country-map-miss-fallback",
-    countryCode: "ZZ",
-  });
+// An EXPLICIT country that the mapping doesn't serve must never be silently
+// answered from the home region: the caller asked about that country, so home
+// results would contradict the request. The HTTP layer already rejects it with
+// 400 before we get here, so reaching this point means a caller skipped that
+// check — a programming error, which throws rather than degrades.
+test("unmapped explicit country throws instead of falling back to home", async () => {
+  await assert.rejects(
+    () => resolveRegion({ countryCode: "ZZ", routingEnabled: true }, deps()),
+    /countryCode "ZZ" is not in the region mapping/
+  );
 });
 
 test("lat/lng reverse-geocodes to country then maps", async () => {
