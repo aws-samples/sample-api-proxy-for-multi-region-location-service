@@ -28,6 +28,22 @@ const ALL_STYLES = ["Standard", "Monochrome", "Hybrid", "Satellite"];
 // re-expanding and re-sorting the 68-entry Set on every request.
 const SORTED_MAP_LABEL_LANGUAGES = [...MAP_LABEL_LANGUAGES].sort();
 
+// The ALB's idle_timeout, pinned to the same value in infra/ecs-fargate.yaml.
+// Change one and you must change the other — the invariant below depends on it.
+const ALB_IDLE_TIMEOUT_MS = 60_000;
+
+// Node defaults keepAliveTimeout to 5s, which is SHORTER than the ALB's idle
+// timeout — the wrong way round behind a load balancer. The ALB would keep a
+// pooled connection that the task closes underneath it, and a request sent as
+// the FIN crosses it fails as a sporadic 502 that no retry here can see. Making
+// the task outlive the balancer means the close is always ALB-initiated.
+// headersTimeout must in turn exceed keepAliveTimeout, or a connection can be
+// reaped between the ALB writing a request and Node reading its headers.
+function applyKeepAliveTimeouts(server) {
+  server.keepAliveTimeout = ALB_IDLE_TIMEOUT_MS + 5_000;
+  server.headersTimeout = server.keepAliveTimeout + 5_000;
+}
+
 // Build the express app from injected dependencies (testable).
 function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles }) {
   const app = express();
@@ -589,7 +605,10 @@ async function main() {
       `   CORS allowlist: ${config.allowedOrigins.length ? config.allowedOrigins.join(", ") : "(none — cross-origin reads disabled)"}`
     );
     console.log(`   API rate limit: ${config.rateLimit.ratePerSec}/s (burst ${config.rateLimit.burst}) per source IP`);
+    console.log(`   Keep-alive timeout: ${server.keepAliveTimeout / 1000}s (must exceed the ALB's ${ALB_IDLE_TIMEOUT_MS / 1000}s idle timeout)`);
   });
+  // Set synchronously, before "listening" fires and any connection is accepted.
+  applyKeepAliveTimeouts(server);
 
   // Graceful shutdown: on ECS deploy/scale-in the task gets SIGTERM. Stop
   // accepting new connections and let in-flight requests finish before exit to
@@ -617,4 +636,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildApp, detectStyles };
+module.exports = { buildApp, detectStyles, applyKeepAliveTimeouts, ALB_IDLE_TIMEOUT_MS };

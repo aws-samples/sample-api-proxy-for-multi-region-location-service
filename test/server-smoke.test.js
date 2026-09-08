@@ -1,6 +1,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { buildApp, detectStyles } = require("../server");
+const http = require("http");
+const { buildApp, detectStyles, applyKeepAliveTimeouts, ALB_IDLE_TIMEOUT_MS } = require("../server");
 // Fully tear down a test server. `close()` stops the listener but leaves already
 // established keep-alive sockets open. Node's fetch pools those sockets per
 // origin (127.0.0.1:PORT), so once the OS hands the same port to a later test's
@@ -48,6 +49,27 @@ test("buildApp returns an express app without throwing", () => {
 // would put attacker-controlled strings back into qs for no benefit.
 test('query parser stays "simple" (keeps qs out of the request path)', () => {
   assert.strictEqual(buildApp(fakeDeps()).get("query parser"), "simple");
+});
+
+// Node's default keepAliveTimeout (5s) is far SHORTER than the ALB's idle
+// timeout (60s), which is the wrong way round: the ALB keeps a pooled
+// connection the target closes underneath it, and a request sent as the FIN
+// arrives fails as a sporadic 502. The target must outlive the balancer so the
+// close is always ALB-initiated. headersTimeout must in turn exceed
+// keepAliveTimeout, or a kept-alive connection can be reaped mid-request.
+test("keep-alive timeouts outlive the ALB idle timeout", () => {
+  const srv = http.createServer();
+  assert.strictEqual(srv.keepAliveTimeout, 5000, "Node's unsafe default");
+  applyKeepAliveTimeouts(srv);
+  assert.ok(
+    srv.keepAliveTimeout > ALB_IDLE_TIMEOUT_MS,
+    `keepAliveTimeout ${srv.keepAliveTimeout} must exceed ALB idle ${ALB_IDLE_TIMEOUT_MS}`
+  );
+  assert.ok(
+    srv.headersTimeout > srv.keepAliveTimeout,
+    `headersTimeout ${srv.headersTimeout} must exceed keepAliveTimeout ${srv.keepAliveTimeout}`
+  );
+  srv.close();
 });
 
 test("baseline security headers are set on responses", async () => {

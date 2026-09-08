@@ -251,6 +251,13 @@ Resources:
         - !Ref PublicSubnetB
       SecurityGroups:
         - !Ref ALBSecurityGroup
+      # Pinned to the AWS default rather than left implicit: the app sets its own
+      # keepAliveTimeout to 65s specifically to outlive this value (see
+      # ALB_IDLE_TIMEOUT_MS in server.js). Raising it here without raising the
+      # app's re-introduces the sporadic 502 that pairing them prevents.
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
 
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
