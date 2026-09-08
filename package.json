@@ -4,11 +4,14 @@
   "description": "Amazon Location Service - Server-side Proxy for Address Autocomplete & Maps",
   "license": "MIT-0",
   "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
     "test": "node --test"
   },
   "dependencies": {
-    "express": "^4.21.0"
+    "express": "^5.2.1"
   }
 }

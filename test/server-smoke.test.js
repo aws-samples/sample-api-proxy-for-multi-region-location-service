@@ -41,6 +41,15 @@ test("buildApp returns an express app without throwing", () => {
   assert.strictEqual(typeof app.listen, "function");
 });
 
+// A guard, not a feature: Express 5 parses query strings with Node's own
+// querystring ("simple") instead of qs, which keeps qs out of the request path
+// entirely. Every parameter this API takes is a flat scalar, so nothing here
+// needs qs's nested/bracket syntax — setting this to "extended" to support it
+// would put attacker-controlled strings back into qs for no benefit.
+test('query parser stays "simple" (keeps qs out of the request path)', () => {
+  assert.strictEqual(buildApp(fakeDeps()).get("query parser"), "simple");
+});
+
 test("baseline security headers are set on responses", async () => {
   const app = buildApp(fakeDeps());
   const server = app.listen(0);
@@ -173,13 +182,16 @@ test("suggest returns 400 for a non-integer or out-of-range ?limit", async () =>
   const server = app.listen(0);
   const port = server.address().port;
   const statuses = [];
-  for (const limit of ["abc", "0", "101", "5.5", "-1"]) {
-    const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&limit=${limit}`);
+  // The last case is a REPEATED param: the query parser hands those over as an
+  // array (["5","9"]), which has no sane single value, so it must be rejected
+  // rather than coerced to whichever end the parser happens to keep.
+  for (const qs of ["limit=abc", "limit=0", "limit=101", "limit=5.5", "limit=-1", "limit=5&limit=9"]) {
+    const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&${qs}`);
     statuses.push(res.status);
     await res.text();
   }
   shutdown(server);
-  assert.deepStrictEqual(statuses, [400, 400, 400, 400, 400]);
+  assert.deepStrictEqual(statuses, [400, 400, 400, 400, 400, 400]);
   assert.strictEqual(called, false, "must not reach ALS with an invalid limit");
 });
 
