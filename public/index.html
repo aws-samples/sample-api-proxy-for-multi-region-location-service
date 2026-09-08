@@ -28,10 +28,22 @@
     }
     #country-input { width: 110px; flex: 0 0 auto; text-transform: uppercase; }
     #search-input { flex: 1 1 auto; }
+    /* One row under the search box: context-follow on the left, suggestion-count
+       on the right. align-items:stretch keeps both cards the same height. */
+    .option-row { display: flex; gap: 6px; margin-top: 6px; align-items: stretch; }
     .follow-toggle {
-      display: block; margin-top: 6px; padding: 6px 10px;
+      display: flex; align-items: center; gap: 4px; flex: 1 1 auto; padding: 6px 10px;
       background: #fff; border-radius: 8px; font-size: 12px; color: #555;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15); cursor: pointer;
+    }
+    .limit-picker {
+      display: flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 6px 10px;
+      background: #fff; border-radius: 8px; font-size: 12px; color: #555;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15); white-space: nowrap;
+    }
+    .limit-picker select {
+      border: 1px solid #ddd; border-radius: 6px;
+      padding: 3px 4px; font-size: 12px; background: #fff; outline: none;
     }
     #country-input[aria-invalid="true"] { outline: 2px solid #d13212; }
     .country-warning {
@@ -43,7 +55,9 @@
     .suggestions {
       margin-top: 4px; background: #fff; border-radius: 8px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.15);
-      overflow: hidden; display: none;
+      /* 20 suggestions are ~1200px tall — taller than most viewports — so cap the
+         list and scroll it instead of letting it run off the bottom of the screen. */
+      overflow-x: hidden; overflow-y: auto; max-height: 60vh; display: none;
     }
     .suggestions.active { display: block; }
     .suggestion-item {
@@ -113,9 +127,19 @@
     </div>
     <div id="suggestions" class="suggestions"></div>
     <div id="country-warning" class="country-warning" role="alert"></div>
-    <label class="follow-toggle" title="选中某国结果后，自动把该国代码填入国家框，后续搜索沿用该国上下文。关闭则每次都从 HOME 全球搜索。">
-      <input type="checkbox" id="context-follow" checked /> 跟随所选结果的国家上下文
-    </label>
+    <div class="option-row">
+      <label class="follow-toggle" title="选中某国结果后，自动把该国代码填入国家框，后续搜索沿用该国上下文。关闭则每次都从 HOME 全球搜索。">
+        <input type="checkbox" id="context-follow" checked /> 跟随所选结果的国家上下文
+      </label>
+      <label class="limit-picker" title="传给 Suggest 的 MaxResults（返回条数上限，服务可能返回更少）。按请求计费，与条数无关。">
+        建议条数
+        <select id="limit-select">
+          <option value="5" selected>5</option>
+          <option value="10">10</option>
+          <option value="20">20</option>
+        </select>
+      </label>
+    </div>
   </div>
 
   <div id="info-panel" class="info-panel">
@@ -439,6 +463,7 @@
     let selectionSeq = 0;
     const input = document.getElementById("search-input");
     const sugBox = document.getElementById("suggestions");
+    const limitSelect = document.getElementById("limit-select");
 
     input.addEventListener("input", () => {
       clearTimeout(timer);
@@ -457,6 +482,18 @@
       if (sugBox.children.length) sugBox.classList.add("active");
     });
 
+    // Changing the count re-runs the current query immediately (no debounce: this
+    // is a deliberate click, not typing). The new token invalidates any in-flight
+    // response so a slower older request can't repaint the list with the old count.
+    limitSelect.addEventListener("change", () => {
+      const q = input.value.trim();
+      if (!q) return;
+      clearTimeout(timer);
+      const seq = ++suggestSeq;
+      selectionSeq++;
+      fetchSuggestions(q, seq);
+    });
+
     document.addEventListener("click", (e) => {
       if (!e.target.closest(".search-box")) sugBox.classList.remove("active");
     });
@@ -466,6 +503,9 @@
       // The map center is deliberately NOT used.
       const params = routingParams();
       params.set("query", query);
+      // MaxResults upper bound. The select only offers values inside the API's
+      // 1-100 range, so this never trips the backend's 400.
+      params.set("limit", limitSelect.value);
       // Keep search text in sync with an explicit map-language selection. In auto
       // mode omit it so the backend derives the Places language from the same
       // country/location context used for labels.
@@ -497,7 +537,12 @@
           div.className = "suggestion-item";
 
           const addr = item.address;
-          const subText = addr ? [addr.District, addr.Municipality, addr.Region, addr.Country?.Name].filter(Boolean).join(", ") : "";
+          // GeoPlaces v2 Address field names: the city is `Locality` (v1's
+          // `Municipality` no longer exists), and `Region`/`Country` are objects
+          // — joining them directly would render "[object Object]".
+          const subText = addr
+            ? [addr.District, addr.Locality, addr.Region?.Name, addr.Country?.Name].filter(Boolean).join(", ")
+            : "";
 
           // Build with textContent (not innerHTML): item.text/subText come from
           // the ALS response, so interpolating them as HTML would be an XSS sink
@@ -708,7 +753,7 @@
           if (seq !== selectionSeq) return;
           showResult({
             lng, lat, title: item.text,
-            infoAddr: addr ? [addr.Street, addr.District, addr.Municipality].filter(Boolean).join(" ") : "",
+            infoAddr: addr ? [addr.Street, addr.District, addr.Locality].filter(Boolean).join(" ") : "",
             tileRegion: tr.tileRegion, country: tr.country,
           });
           return;

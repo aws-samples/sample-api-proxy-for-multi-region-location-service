@@ -77,6 +77,17 @@ test("createMappingStore reads the example config and looks up regions", () => {
   assert.ok(store.size > 0);
 });
 
+// Major markets whose absence from the example produced real "Unsupported
+// countryCode" reports from deployments that copied the example verbatim. "UK"
+// stays unmapped on purpose: it is not the ISO code (GB is), so it must keep
+// failing fast rather than being silently accepted.
+test("example mapping covers GB and CA (copied-verbatim deployments hit these)", () => {
+  const store = createMappingStore(EXAMPLE_MAP);
+  assert.strictEqual(store.getRegion("GB"), "eu-central-1");
+  assert.strictEqual(store.getRegion("CA"), "us-east-1");
+  assert.strictEqual(store.getRegion("UK"), null);
+});
+
 test("createMappingStore exposes the region set and home region", () => {
   const store = createMappingStore(EXAMPLE_MAP);
   assert.ok(store.regions.has("ap-northeast-1"));

@@ -130,6 +130,59 @@ test("suggest uses real lat/lng as bias when provided", async () => {
   assert.strictEqual(Number(seen.lng), 139.7);
 });
 
+test("suggest forwards a valid ?limit as maxResults", async () => {
+  const deps = fakeDeps();
+  let seen;
+  deps.als.suggest = async (args) => {
+    seen = args;
+    return { ResultItems: [] };
+  };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE&limit=10`);
+  shutdown(server);
+  assert.strictEqual(seen.maxResults, 10);
+});
+
+test("suggest without ?limit leaves maxResults unset (client default applies)", async () => {
+  const deps = fakeDeps();
+  let seen;
+  deps.als.suggest = async (args) => {
+    seen = args;
+    return { ResultItems: [] };
+  };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&countryCode=DE`);
+  shutdown(server);
+  assert.strictEqual(seen.maxResults, undefined);
+});
+
+// Reject out-of-contract limits here so the caller gets our 400 rather than an
+// upstream ALS ValidationException surfacing as a generic proxy error.
+test("suggest returns 400 for a non-integer or out-of-range ?limit", async () => {
+  const deps = fakeDeps();
+  let called = false;
+  deps.als.suggest = async () => {
+    called = true;
+    return { ResultItems: [] };
+  };
+  const app = buildApp(deps);
+  const server = app.listen(0);
+  const port = server.address().port;
+  const statuses = [];
+  for (const limit of ["abc", "0", "101", "5.5", "-1"]) {
+    const res = await fetch(`http://127.0.0.1:${port}/api/suggest?query=x&limit=${limit}`);
+    statuses.push(res.status);
+    await res.text();
+  }
+  shutdown(server);
+  assert.deepStrictEqual(statuses, [400, 400, 400, 400, 400]);
+  assert.strictEqual(called, false, "must not reach ALS with an invalid limit");
+});
+
 test("suggest forwards a normalized Places language to als", async () => {
   const deps = fakeDeps();
   let seen;

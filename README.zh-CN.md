@@ -73,7 +73,7 @@
 | 端点 | 参数 | 返回 |
 |---|---|---|
 | `/health` | — | `{"status":"ok"}` |
-| `/api/suggest` | `query`(必填) + 路由参数 + `lang` | `[{placeId, text, address, position, region}]`。`query` 为空时返回 `[]`（200） |
+| `/api/suggest` | `query`(必填) + 路由参数 + `lang` + `limit` | `[{placeId, text, address, position, region}]`。`query` 为空时返回 `[]`（200） |
 | `/api/place/:placeId` | `region` + 路由参数 + `lang` | `{label, position, address, tileRegion, country}` |
 | `/api/reverse-geocode` | `lat`+`lng`(**必填**), `lang` | `{place, country, tileRegion, language}`，`place` 可为 `null` |
 | `/api/tile-region` | `lat`+`lng` | `{tileRegion, country}` |
@@ -100,6 +100,8 @@
 
 几处需要注意的地方：
 
+- **`/api/suggest` 的 `limit` 是上限，不是条数。** 它对应 Suggest API 的 `MaxResults`（1–100 的整数；其它取值在本代理层直接返回 400，不再浪费一次上游调用）。不传时代理请求 5 条，而 Amazon Location 自身的默认值是 20。实际返回可能更少：服务本身可能返回更少，且非 `Place` 类型的建议会被过滤掉。计费按请求次数而非结果条数，所以放大 `limit` 只增加响应体大小，不额外产生费用。
+- **`limit` 取大值是为了「多取后处理」，不是为了多显示。** API 允许到 100，是给需要后处理的调用方用的：按类别或距离过滤、去重、重新排序、与自有数据关联，先拿到更大的候选集，再只显示挑出来的那几条。这是服务端或客户端有意设计的处理流水线，而不是把下拉列表拉长。所以本 demo 前端只提供 5/10/20——一个没人会去滚动的自动补全列表，拿 50 条原始建议没有意义。
 - **`/api/place` 的 `region` 必须回传。** PlaceId 是**区域作用域**的，GetPlace 必须在产生它的区域执行——所以 `/api/suggest` 的每条结果都带 `region`，客户端要原样传回。不传则退回常规区域解析，可能因区域不匹配而查不到。
 - **`tileRegion` ≠ 查询所用区域。** 它是覆盖**结果所在国家**的区域，供客户端切换地图瓦片；跨境结果两者会不同。
 - **`/api/map-style` 与 `/api/map-labels` 额外返回两个响应头**：`X-Map-Label-Language` 和 `X-Map-Label-Language-Source`（值为 `explicit` / `country-map` / `config-default` / `fallback`），并通过 `Access-Control-Expose-Headers` 暴露给跨源调用方。
@@ -152,14 +154,15 @@ home 区域与部署区域相互独立，可相同也可不同（例如：为降
 {
   "ap-northeast-1": ["*", "JP", "KR"],
   "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH"],
-  "eu-central-1": ["DE", "FR", "NL", "IE", "ES", "IT"],
+  "eu-central-1": ["GB", "DE", "FR", "NL", "IE", "ES", "IT"],
   "us-east-1": ["US", "CA", "MX"]
 }
 ```
 
 - 每个顶层 key 都是一个在用区域（生成 CloudFront 行为、需要 key、启动时校验）。
 - 必须且只能有一个区域在国家列表里含 `"*"`——它标记 **home 区域**（回落 + 逆地理编码引导）。该区域也可同时服务具体国家（如上），或仅作回落（`"ap-northeast-1": ["*"]`）。
-- 未列出的国家在请求时回落到 home 区域（会记日志，不报错）。
+- 未列出的国家分两种情况，取决于请求怎么给出这个国家：**显式传 `countryCode`** 会被拒绝并返回 **400**（`Unsupported countryCode "XX" (not a served country in the mapping)`）——映射表就是「已服务国家」的准入名单，光是合法的 ISO 码还不够；而由 **`lat`/`lng` 反查得到的国家**则回落到 home 区域（记日志，不报错）。所以新开一个市场，必须把它加进这个文件。
+- 加入某个国家之前，先确认目标区域的地图数据提供方对它的覆盖质量。把一个国家路由到本地数据薄弱的区域，比不列出、让它走 home 区域更糟——所以示例文件故意只列了一部分国家，它是一份需要你逐个核实的起点，而不是照着往下抄的清单。
 
 **真实的** `config/country-region-map.json` 已加入 `.gitignore`（国家清单因部署而异），仓库只跟踪 `config/country-region-map-example.json`。请从示例创建你的真实文件：
 

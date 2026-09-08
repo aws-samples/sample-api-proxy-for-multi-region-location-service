@@ -137,10 +137,12 @@ function createAlsClient({
   // lang controls the result display language only (not input); defaults to en
   // (this proxy targets overseas regions). includeCountries (ISO codes) becomes
   // a hard Filter.IncludeCountries — it coexists with BiasPosition and overrides
-  // bias ranking, so results are constrained to those countries.
-  async function suggest({ region, key, query, lat, lng, includeCountries, lang }) {
+  // bias ranking, so results are constrained to those countries. maxResults maps
+  // to MaxResults (ALS accepts 1-100, defaults to 20); we default to 5 to keep the
+  // demo's suggestion dropdown short. It is an upper bound, not a guarantee.
+  async function suggest({ region, key, query, lat, lng, includeCountries, lang, maxResults }) {
     const params = new URLSearchParams({ key });
-    const body = { QueryText: query, Language: lang || "en", MaxResults: 5 };
+    const body = { QueryText: query, Language: lang || "en", MaxResults: maxResults || 5 };
     if (lat != null && lng != null) body.BiasPosition = [parseFloat(lng), parseFloat(lat)];
     if (includeCountries && includeCountries.length) {
       body.Filter = { IncludeCountries: includeCountries };

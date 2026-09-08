@@ -87,7 +87,7 @@ Every endpoint is a `GET` returning JSON. `/api/*` applies the CORS response pol
 | Endpoint | Parameters | Returns |
 |---|---|---|
 | `/health` | — | `{"status":"ok"}` |
-| `/api/suggest` | `query` (required) + routing params + `lang` | `[{placeId, text, address, position, region}]`. An empty `query` returns `[]` (200) |
+| `/api/suggest` | `query` (required) + routing params + `lang` + `limit` | `[{placeId, text, address, position, region}]`. An empty `query` returns `[]` (200) |
 | `/api/place/:placeId` | `region` + routing params + `lang` | `{label, position, address, tileRegion, country}` |
 | `/api/reverse-geocode` | `lat`+`lng` (**required**), `lang` | `{place, country, tileRegion, language}`; `place` may be `null` |
 | `/api/tile-region` | `lat`+`lng` | `{tileRegion, country}` |
@@ -99,6 +99,8 @@ Every endpoint is a `GET` returning JSON. `/api/*` applies the CORS response pol
 
 Easy things to get wrong:
 
+- **`/api/suggest`'s `limit` is an upper bound, not a count.** It maps to the Suggest API's `MaxResults` (integer 1–100; anything else returns 400 here rather than upstream). Omitted, the proxy asks for 5 — Amazon Location's own default is 20. The response can still be shorter: the service may return fewer, and non-`Place` suggestions are filtered out. Billing is per request, not per result, so a larger `limit` costs nothing extra beyond response size.
+- **A large `limit` is for over-fetching, not for display.** The API accepts up to 100 so a caller that needs to post-process — filter by category or distance, dedupe, re-rank, join against its own data — can ask for a wider candidate set and then show only the few rows it wants. That is a deliberate server- or client-side pipeline, not a bigger dropdown. The demo UI therefore offers only 5/10/20: an autocomplete list nobody scrolls gains nothing from 50 raw suggestions.
 - **`/api/place` needs its `region` echoed back.** A PlaceId is **region-scoped**, so GetPlace must run in the region that produced it — which is why every `/api/suggest` result carries `region` for the client to pass through. Omitting it falls back to normal region resolution and can miss the place entirely.
 - **`tileRegion` is not the region that was queried.** It is the region whose map data covers the **result's country**, for the client to switch tiles to; for a cross-border result the two differ.
 - **`/api/map-style` and `/api/map-labels` also return two headers**: `X-Map-Label-Language` and `X-Map-Label-Language-Source` (`explicit` / `country-map` / `config-default` / `fallback`), exposed to cross-origin callers via `Access-Control-Expose-Headers`.
@@ -151,14 +153,15 @@ The home region and the deploy region are independent: they can be the same or d
 {
   "ap-northeast-1": ["*", "JP", "KR"],
   "ap-southeast-1": ["SG", "MY", "TH", "ID", "VN", "PH"],
-  "eu-central-1": ["DE", "FR", "NL", "IE", "ES", "IT"],
+  "eu-central-1": ["GB", "DE", "FR", "NL", "IE", "ES", "IT"],
   "us-east-1": ["US", "CA", "MX"]
 }
 ```
 
 - Each top-level key is an in-use region (gets a CloudFront behavior, needs a key, is validated at startup).
 - Exactly one region must include `"*"` in its country list — that marks the **home region** (fallback + reverse-geocode guide). It may also serve specific countries (as above) or be fallback-only (`"ap-northeast-1": ["*"]`).
-- A country not listed anywhere falls back to the home region at request time (logged, never an error).
+- A country not listed anywhere behaves differently depending on how the request supplied it. An **explicit `countryCode`** is rejected with **400** (`Unsupported countryCode "XX" (not a served country in the mapping)`) — the mapping is the allowlist of served countries, so a valid ISO code alone is not enough. A country **reverse-geocoded from `lat`/`lng`** falls back to the home region (logged, never an error). Adding a market therefore means adding it to this file.
+- Before adding a country, check that the target region's map data provider actually covers it well. Routing a country to a region whose provider has weak local data is worse than leaving it unlisted on the home region, so the example file deliberately lists fewer countries than exist — treat it as a starting point to verify, not a table to extend blindly.
 
 The **real** `config/country-region-map.json` is gitignored (the country list is deployment-specific). The repo tracks `config/country-region-map-example.json`. Create your real file from it:
 

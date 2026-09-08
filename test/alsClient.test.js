@@ -90,6 +90,20 @@ test("suggest passes an explicit lang through as Language", async () => {
   assert.strictEqual(JSON.parse(captured.opts.body).Language, "th");
 });
 
+test("suggest defaults MaxResults to 5 when no maxResults is given", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { ResultItems: [] }) });
+  await als.suggest({ region: "eu-west-1", key: "k", query: "paris" });
+  assert.strictEqual(JSON.parse(captured.opts.body).MaxResults, 5);
+});
+
+test("suggest passes an explicit maxResults through as MaxResults", async () => {
+  const captured = {};
+  const als = createAlsClient({ fetchImpl: fakeFetch(captured, { ResultItems: [] }) });
+  await als.suggest({ region: "eu-west-1", key: "k", query: "paris", maxResults: 25 });
+  assert.strictEqual(JSON.parse(captured.opts.body).MaxResults, 25);
+});
+
 test("rewriteStyle replaces region origin with CloudFront region-prefixed path and strips key", () => {
   const als = createAlsClient({ fetchImpl: async () => ({}) });
   const style = {

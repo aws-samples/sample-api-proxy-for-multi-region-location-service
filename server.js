@@ -116,6 +116,24 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     return { code: cc };
   }
 
+  // Validate an optional suggestion-count limit against the ALS Suggest contract
+  // (MaxResults: integer 1-100). Returns the parsed number, undefined when absent
+  // (the client applies its own smaller default), or { error } so the caller can
+  // 400 — an out-of-range value would otherwise come back as an opaque upstream
+  // ValidationException. Repeated ?limit params arrive as an array and are
+  // rejected here too, since there is no sane value to pick.
+  function normalizeLimit(limit) {
+    if (limit === undefined || limit === "") return { value: undefined };
+    if (!/^\d+$/.test(String(limit))) {
+      return { error: "limit must be an integer between 1 and 100" };
+    }
+    const value = Number(limit);
+    if (value < 1 || value > 100) {
+      return { error: "limit must be between 1 and 100" };
+    }
+    return { value };
+  }
+
   // Resolve the routing decision for a request from countryCode or lat/lng.
   // Returns the full { targetRegion, source, countryCode } so callers can reuse
   // the resolved country for language decisions instead of repeating a lookup.
@@ -153,7 +171,7 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
   app.get("/favicon.ico", (req, res) => res.status(204).end());
 
   app.get("/api/suggest", async (req, res) => {
-    const { query, lat, lng, countryCode, lang } = req.query;
+    const { query, lat, lng, countryCode, lang, limit } = req.query;
     if (!query) return res.json([]);
     const coords = parseCoords(lat, lng);
     if (!coords.valid) return res.status(400).json({ error: coords.error });
@@ -161,6 +179,8 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
     if (country.error) return res.status(400).json({ error: country.error });
     const language = normalizePlacesLanguage(lang);
     if (language.error) return res.status(400).json({ error: language.error });
+    const maxResults = normalizeLimit(limit);
+    if (maxResults.error) return res.status(400).json({ error: maxResults.error });
     try {
       const target = await resolveTargetFor({ countryCode: country.code, lat: coords.lat, lng: coords.lng });
       const region = target.targetRegion;
@@ -202,6 +222,9 @@ function buildApp({ config, mappingStore, als, reverseGeocoder, availableStyles 
         lng: biasLng,
         includeCountries,
         lang: placesLanguage,
+        // Upper bound only: ALS may return fewer, and the Place filter below can
+        // trim further, so the response length is <= limit.
+        maxResults: maxResults.value,
       });
       const suggestions = (data.ResultItems || [])
         .filter((item) => item.SuggestResultItemType === "Place" && item.Place)
